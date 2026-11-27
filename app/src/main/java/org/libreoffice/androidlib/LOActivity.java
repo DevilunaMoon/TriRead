@@ -1,6 +1,7 @@
 package org.libreoffice.androidlib;
 
 import android.app.Activity;
+import android.content.res.AssetManager;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Base64;
@@ -58,12 +59,17 @@ public class LOActivity {
         COKit.putenv("SAL_LOG=-WARN-INFO");
         COKit.putenv("HOME=" + cacheDir);
         COKit.putenv("TMPDIR=" + cacheDir);
-        COKit.init(activity);
-        Bootstrap.setup(dataDir, cacheDir, apkFile);
 
         if (!coolwsdStarted) {
             coolwsdStarted = true;
-            createCOOLWSD(fileUriString, userName);
+            createCOOLWSD(
+                    dataDir,
+                    cacheDir,
+                    apkFile,
+                    activity.getAssets(),
+                    fileUriString,
+                    userName
+            );
         }
     }
 
@@ -109,7 +115,14 @@ public class LOActivity {
     }
 
     // Native methods exported by libandroidapp.so
-    public native void createCOOLWSD(String loadFileUri, String userName);
+    public native void createCOOLWSD(
+            String dataDir,
+            String cacheDir,
+            String apkFile,
+            AssetManager assetManager,
+            String loadFileUri,
+            String userName
+    );
 
     public native void postMobileMessageNative(String message);
 
