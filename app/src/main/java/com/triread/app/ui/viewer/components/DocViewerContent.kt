@@ -330,18 +330,25 @@ private fun LiteralPrintPageSheet(
                         bottom = (padBottom * 0.28f).coerceAtLeast(6.dp)
                     )
             ) {
-                // Header Section: stacked vertically in exact document order & real EMU extent sizes
+                // Header Section: layer anchored header images by z-order (relativeHeight) so front letterheads cover older logos
                 if (header != null && header.isNotEmpty) {
+                    val headerImages = header.elements.filterIsInstance<HeaderFooterElement.Image>()
+                    val headerLines = header.elements.filterIsInstance<HeaderFooterElement.TextLine>()
+
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(bottom = (8f * ptScale).dp),
+                            .padding(bottom = (6f * ptScale).dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.spacedBy((2f * ptScale).dp)
                     ) {
-                        header.elements.forEach { elem ->
-                            when (elem) {
-                                is HeaderFooterElement.Image -> {
+                        if (headerImages.isNotEmpty()) {
+                            val orderedImages = headerImages.sortedBy { it.relativeHeight }
+                            Box(
+                                modifier = Modifier.fillMaxWidth(),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                orderedImages.forEachIndexed { idx, elem ->
                                     val imgModifier = if (elem.widthPt != null && elem.heightPt != null) {
                                         val wDp = (elem.widthPt * ptScale).dp.coerceAtMost(usableWidthDp)
                                         val ratio = (elem.widthPt / elem.heightPt.coerceAtLeast(1f)).coerceIn(0.2f, 12f)
@@ -353,6 +360,12 @@ private fun LiteralPrintPageSheet(
                                             .widthIn(max = usableWidthDp)
                                             .height((44f * ptScale).dp.coerceIn(22.dp, 56.dp))
                                     }
+                                    // Top-most layered image gets a clean white backing to cover any older logo beneath it.
+                                    val backingMod = if (orderedImages.size > 1 && idx == orderedImages.lastIndex) {
+                                        Modifier.background(Color.White)
+                                    } else {
+                                        Modifier
+                                    }
                                     AsyncImage(
                                         model = ImageRequest.Builder(context)
                                             .data(File(elem.imagePath))
@@ -360,24 +373,24 @@ private fun LiteralPrintPageSheet(
                                             .build(),
                                         contentDescription = "Document header logo",
                                         contentScale = ContentScale.Fit,
-                                        modifier = imgModifier
-                                    )
-                                }
-
-                                is HeaderFooterElement.TextLine -> {
-                                    val hdrSp = ((7.5f * ptScale) / fontScale).coerceIn(4.8f, 11f)
-                                    Text(
-                                        text = elem.text,
-                                        color = Color(0xFF1F2937),
-                                        fontSize = hdrSp.sp,
-                                        lineHeight = (hdrSp * 1.15f).sp,
-                                        fontWeight = FontWeight.SemiBold,
-                                        fontFamily = resolveDocFontFamily(elem.fontFamilyName),
-                                        textAlign = TextAlign.Center,
-                                        modifier = Modifier.fillMaxWidth()
+                                        modifier = imgModifier.then(backingMod)
                                     )
                                 }
                             }
+                        }
+
+                        val hdrSp = ((7.5f * ptScale) / fontScale).coerceIn(4.8f, 11f)
+                        headerLines.forEach { elem ->
+                            Text(
+                                text = elem.text,
+                                color = Color(0xFF1F2937),
+                                fontSize = hdrSp.sp,
+                                lineHeight = (hdrSp * 1.15f).sp,
+                                fontWeight = FontWeight.SemiBold,
+                                fontFamily = resolveDocFontFamily(elem.fontFamilyName),
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.fillMaxWidth()
+                            )
                         }
                     }
                 } else {

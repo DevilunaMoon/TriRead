@@ -36,7 +36,9 @@ sealed interface HeaderFooterElement {
     data class Image(
         val imagePath: String,
         val widthPt: Float? = null,
-        val heightPt: Float? = null
+        val heightPt: Float? = null,
+        val isAnchored: Boolean = false,
+        val relativeHeight: Long = 0L
     ) : HeaderFooterElement
 
     data class TextLine(
@@ -315,6 +317,8 @@ class DocxParser(
             var inDrawing = false
             var drawingHidden = false
             var drawingBehindDoc = false
+            var drawingIsAnchored = false
+            var drawingRelativeHeight = 0L
             val currentLine = StringBuilder()
             var currentFont: String? = null
             var pendingExtentWidthPt: Float? = null
@@ -338,14 +342,19 @@ class DocxParser(
                                     inDrawing = true
                                     drawingHidden = false
                                     drawingBehindDoc = false
+                                    drawingIsAnchored = false
+                                    drawingRelativeHeight = 0L
                                     pendingExtentWidthPt = null
                                     pendingExtentHeightPt = null
                                 }
                                 "anchor" -> if (inDrawing) {
+                                    drawingIsAnchored = true
                                     val behind = findAttributeByLocalName(parser, "behindDoc")
                                     if (behind == "1" || behind.equals("true", ignoreCase = true)) {
                                         drawingBehindDoc = true
                                     }
+                                    drawingRelativeHeight = findAttributeByLocalName(parser, "relativeHeight")
+                                        ?.toLongOrNull() ?: 0L
                                 }
                                 "docPr" -> if (inDrawing) {
                                     val hidden = findAttributeByLocalName(parser, "hidden")
@@ -381,7 +390,9 @@ class DocxParser(
                                                 element = HeaderFooterElement.Image(
                                                     imagePath = path,
                                                     widthPt = pendingExtentWidthPt,
-                                                    heightPt = pendingExtentHeightPt
+                                                    heightPt = pendingExtentHeightPt,
+                                                    isAnchored = drawingIsAnchored,
+                                                    relativeHeight = drawingRelativeHeight
                                                 ),
                                                 isBehindDoc = drawingBehindDoc
                                             )
@@ -399,9 +410,11 @@ class DocxParser(
                                                 element = HeaderFooterElement.Image(
                                                     imagePath = path,
                                                     widthPt = pendingExtentWidthPt,
-                                                    heightPt = pendingExtentHeightPt
+                                                    heightPt = pendingExtentHeightPt,
+                                                    isAnchored = true,
+                                                    relativeHeight = -1L
                                                 ),
-                                                isBehindDoc = drawingBehindDoc
+                                                isBehindDoc = true
                                             )
                                         )
                                         pendingExtentWidthPt = null
