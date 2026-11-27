@@ -23,7 +23,7 @@ import java.io.InputStream;
 public class LOActivity {
 
     private static final String LOGTAG = "CollaboraBridge";
-    private static final String UNPACK_MARKER = ".collabora_unpacked_v1";
+    private static final String UNPACK_MARKER = ".collabora_unpacked_v2";
 
     static {
         COKit.ensureLibrariesLoaded();
@@ -32,7 +32,6 @@ public class LOActivity {
     private final Activity activity;
     private static final Handler mainHandler = new Handler(Looper.getMainLooper());
     private static volatile WebView activeWebView;
-    private static volatile boolean coolwsdStarted = false;
     private static volatile Runnable activeCloseCallback;
 
     public LOActivity(Activity activity) {
@@ -50,37 +49,36 @@ public class LOActivity {
     }
 
     public synchronized void ensureInitializedAndStart(String fileUriString, String userName) {
-        unpackAssetsIfNeeded();
-
         String dataDir = activity.getApplicationInfo().dataDir;
         String cacheDir = activity.getApplication().getCacheDir().getAbsolutePath();
         String apkFile = activity.getApplication().getPackageResourcePath();
+
+        unpackAssetsIfNeeded(new File(dataDir));
 
         COKit.putenv("SAL_LOG=-WARN-INFO");
         COKit.putenv("HOME=" + cacheDir);
         COKit.putenv("TMPDIR=" + cacheDir);
 
-        if (!coolwsdStarted) {
-            coolwsdStarted = true;
-            createCOOLWSD(
-                    dataDir,
-                    cacheDir,
-                    apkFile,
-                    activity.getAssets(),
-                    fileUriString,
-                    userName
-            );
-        }
+        // Native createCOOLWSD updates documentLoadURI & g_loActivityObj on every call
+        // and only starts the COOLWSD background thread once.
+        createCOOLWSD(
+                dataDir,
+                cacheDir,
+                apkFile,
+                activity.getAssets(),
+                fileUriString,
+                "classic",
+                userName
+        );
     }
 
-    private void unpackAssetsIfNeeded() {
-        File filesDir = activity.getFilesDir();
-        File marker = new File(filesDir, UNPACK_MARKER);
+    private void unpackAssetsIfNeeded(File dataDir) {
+        File marker = new File(dataDir, UNPACK_MARKER);
         if (marker.exists()) {
             return;
         }
         try {
-            copyAssetTree("unpack", filesDir);
+            copyAssetTree("unpack", dataDir);
             try (FileOutputStream fos = new FileOutputStream(marker)) {
                 fos.write('1');
             }
@@ -121,6 +119,7 @@ public class LOActivity {
             String apkFile,
             AssetManager assetManager,
             String loadFileUri,
+            String uiMode,
             String userName
     );
 
