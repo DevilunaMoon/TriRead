@@ -3,6 +3,7 @@ package com.triread.app.ui.viewer
 import android.graphics.Bitmap
 import androidx.compose.ui.graphics.Color
 import com.triread.app.data.parser.DocBlock
+import com.triread.app.data.parser.DocHeaderFooter
 import com.triread.app.data.parser.DocPageMetrics
 import com.triread.app.data.parser.SlideItem
 import com.triread.app.domain.model.DocumentItem
@@ -62,8 +63,8 @@ sealed interface ViewerContentState {
         val blocks: List<DocBlock>,
         val initialBlockIndex: Int,
         val pageMetrics: DocPageMetrics = DocPageMetrics(),
-        val headerText: String? = null,
-        val footerText: String? = null,
+        val header: DocHeaderFooter? = null,
+        val footer: DocHeaderFooter? = null,
         val noticeMessage: String? = null
     ) : ViewerContentState
 

@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
@@ -20,6 +21,9 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
@@ -64,6 +68,7 @@ import coil.request.ImageRequest
 import com.triread.app.data.parser.DocTextAlignment
 import com.triread.app.data.parser.SlideElement
 import com.triread.app.data.parser.SlideItem
+import com.triread.app.data.parser.SlideVerticalAlignment
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import java.io.File
@@ -76,6 +81,157 @@ fun PptViewerContent(
     slideWidthPt: Float,
     showSpeakerNotes: Boolean,
     isLandscape: Boolean,
+    isImmersive: Boolean,
+    onSlideChanged: (Int) -> Unit,
+    onToggleImmersive: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    if (isLandscape) {
+        PptHorizontalFullscreenContent(
+            slides = slides,
+            initialSlide = initialSlide,
+            slideAspectRatio = slideAspectRatio,
+            slideWidthPt = slideWidthPt,
+            showSpeakerNotes = showSpeakerNotes,
+            onSlideChanged = onSlideChanged,
+            onToggleImmersive = onToggleImmersive,
+            modifier = modifier
+        )
+    } else {
+        PptVerticalStackContent(
+            slides = slides,
+            initialSlide = initialSlide,
+            slideAspectRatio = slideAspectRatio,
+            slideWidthPt = slideWidthPt,
+            showSpeakerNotes = showSpeakerNotes,
+            isImmersive = isImmersive,
+            onSlideChanged = onSlideChanged,
+            onToggleImmersive = onToggleImmersive,
+            modifier = modifier
+        )
+    }
+}
+
+@Composable
+private fun PptVerticalStackContent(
+    slides: List<SlideItem>,
+    initialSlide: Int,
+    slideAspectRatio: Float,
+    slideWidthPt: Float,
+    showSpeakerNotes: Boolean,
+    isImmersive: Boolean,
+    onSlideChanged: (Int) -> Unit,
+    onToggleImmersive: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val listState = rememberLazyListState(
+        initialFirstVisibleItemIndex = initialSlide.coerceIn(0, (slides.size - 1).coerceAtLeast(0))
+    )
+
+    var zoomScale by remember { mutableFloatStateOf(1f) }
+    var panOffset by remember { mutableStateOf(Offset.Zero) }
+    var containerSize by remember { mutableStateOf(IntSize.Zero) }
+
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.firstVisibleItemIndex }
+            .distinctUntilChanged()
+            .collect { index -> onSlideChanged(index) }
+    }
+
+    val currentSlide = slides.getOrNull(listState.firstVisibleItemIndex)
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .background(Color(0xFFE8ECF2))
+    ) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .onSizeChanged { containerSize = it }
+                .pointerInput(Unit) {
+                    detectTapGestures(
+                        onTap = { onToggleImmersive() },
+                        onDoubleTap = {
+                            if (zoomScale > 1.1f) {
+                                zoomScale = 1f
+                                panOffset = Offset.Zero
+                            } else {
+                                zoomScale = 1.85f
+                            }
+                        }
+                    )
+                }
+                .pointerInput(Unit) {
+                    detectTransformGestures { _, pan, zoom, _ ->
+                        val nextScale = (zoomScale * zoom).coerceIn(1f, 3.5f)
+                        zoomScale = nextScale
+                        if (nextScale <= 1.02f) {
+                            panOffset = Offset.Zero
+                        } else {
+                            val maxX = (containerSize.width * (nextScale - 1f)) / 2f
+                            val maxY = (containerSize.height * (nextScale - 1f)) / 2f
+                            panOffset = Offset(
+                                x = (panOffset.x + pan.x).coerceIn(-maxX, maxX),
+                                y = (panOffset.y + pan.y).coerceIn(-maxY, maxY)
+                            )
+                        }
+                    }
+                }
+        ) {
+            LazyColumn(
+                state = listState,
+                userScrollEnabled = zoomScale <= 1.02f,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        scaleX = zoomScale
+                        scaleY = zoomScale
+                        translationX = panOffset.x
+                        translationY = panOffset.y
+                    },
+                contentPadding = PaddingValues(
+                    start = 8.dp,
+                    end = 8.dp,
+                    top = if (isImmersive) 8.dp else 92.dp,
+                    bottom = if (isImmersive) 14.dp else 88.dp
+                ),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                itemsIndexed(items = slides, key = { _, slide -> slide.slideNumber }) { _, slide ->
+                    if (slide.elements.isNotEmpty() || slide.backgroundImagePath != null) {
+                        SlideCanvasSurface(
+                            slide = slide,
+                            slideWidthPt = slideWidthPt,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .aspectRatio(slideAspectRatio)
+                        )
+                    } else {
+                        FallbackSlideCard(
+                            slide = slide,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
+            }
+        }
+
+        SpeakerNotesDrawer(
+            visible = showSpeakerNotes && !currentSlide?.speakerNotes.isNullOrBlank(),
+            notes = currentSlide?.speakerNotes.orEmpty()
+        )
+    }
+}
+
+@Composable
+private fun PptHorizontalFullscreenContent(
+    slides: List<SlideItem>,
+    initialSlide: Int,
+    slideAspectRatio: Float,
+    slideWidthPt: Float,
+    showSpeakerNotes: Boolean,
     onSlideChanged: (Int) -> Unit,
     onToggleImmersive: () -> Unit,
     modifier: Modifier = Modifier
@@ -164,12 +320,15 @@ fun PptViewerContent(
                 }
         ) { index ->
             val slide = slides[index]
-            Box(
+            BoxWithConstraints(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(horizontal = if (isLandscape) 4.dp else 8.dp, vertical = 4.dp),
+                    .padding(horizontal = 4.dp, vertical = 4.dp),
                 contentAlignment = Alignment.Center
             ) {
+                val fitWidth = minOf(maxWidth, maxHeight * slideAspectRatio)
+                val fitHeight = fitWidth / slideAspectRatio
+
                 val transformModifier = Modifier.graphicsLayer {
                     if (index == pagerState.currentPage) {
                         scaleX = zoomScale
@@ -180,11 +339,10 @@ fun PptViewerContent(
                 }
 
                 if (slide.elements.isNotEmpty() || slide.backgroundImagePath != null) {
-                    SlideLayoutCanvas(
+                    SlideCanvasSurface(
                         slide = slide,
-                        aspectRatio = slideAspectRatio,
                         slideWidthPt = slideWidthPt,
-                        modifier = transformModifier
+                        modifier = transformModifier.size(width = fitWidth, height = fitHeight)
                     )
                 } else {
                     FallbackSlideCard(
@@ -195,44 +353,52 @@ fun PptViewerContent(
             }
         }
 
-        AnimatedVisibility(
-            visible = showSpeakerNotes && !currentSlide?.speakerNotes.isNullOrBlank()
+        SpeakerNotesDrawer(
+            visible = showSpeakerNotes && !currentSlide?.speakerNotes.isNullOrBlank(),
+            notes = currentSlide?.speakerNotes.orEmpty()
+        )
+    }
+}
+
+@Composable
+private fun SpeakerNotesDrawer(
+    visible: Boolean,
+    notes: String
+) {
+    AnimatedVisibility(visible = visible) {
+        Surface(
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 4.dp,
+            shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = 180.dp)
         ) {
-            Surface(
-                color = MaterialTheme.colorScheme.surface,
-                tonalElevation = 4.dp,
-                shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp),
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 180.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .verticalScroll(rememberScrollState())
-                        .padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Text(
-                        text = "SPEAKER NOTES",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    Text(
-                        text = currentSlide?.speakerNotes.orEmpty(),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                }
+                Text(
+                    text = "SPEAKER NOTES",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Text(
+                    text = notes,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
             }
         }
     }
 }
 
 @Composable
-private fun SlideLayoutCanvas(
+private fun SlideCanvasSurface(
     slide: SlideItem,
-    aspectRatio: Float,
     slideWidthPt: Float,
     modifier: Modifier = Modifier
 ) {
@@ -240,145 +406,143 @@ private fun SlideLayoutCanvas(
     val fontScale = LocalDensity.current.fontScale.coerceAtLeast(0.5f)
     val bgColor = slide.backgroundColorArgb?.let { Color(it) } ?: Color.White
 
-    // Fit slide strictly inside BOTH width and height so neither portrait nor landscape ever crops edges.
-    BoxWithConstraints(
-        modifier = Modifier.fillMaxSize(),
-        contentAlignment = Alignment.Center
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(4.dp),
+        color = bgColor,
+        shadowElevation = 3.dp
     ) {
-        val fitWidth = minOf(maxWidth, maxHeight * aspectRatio)
-        val fitHeight = fitWidth / aspectRatio
-
-        Surface(
-            modifier = modifier.size(width = fitWidth, height = fitHeight),
-            shape = RoundedCornerShape(4.dp),
-            color = bgColor,
-            shadowElevation = 6.dp
+        BoxWithConstraints(
+            modifier = Modifier
+                .fillMaxSize()
+                .clipToBounds()
         ) {
-            BoxWithConstraints(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .clipToBounds()
-            ) {
-                val canvasWidth = maxWidth
-                val canvasHeight = maxHeight
-                // Proportional point-to-dp scale, normalized against Android system fontScale.
-                val ptScale = canvasWidth.value / slideWidthPt.coerceAtLeast(320f)
+            val canvasWidth = maxWidth
+            val canvasHeight = maxHeight
+            val ptScale = canvasWidth.value / slideWidthPt.coerceAtLeast(320f)
 
-                if (!slide.backgroundImagePath.isNullOrBlank()) {
-                    AsyncImage(
-                        model = ImageRequest.Builder(context)
-                            .data(File(slide.backgroundImagePath))
-                            .crossfade(false)
-                            .build(),
-                        contentDescription = null,
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxSize()
-                    )
-                }
+            if (!slide.backgroundImagePath.isNullOrBlank()) {
+                AsyncImage(
+                    model = ImageRequest.Builder(context)
+                        .data(File(slide.backgroundImagePath))
+                        .crossfade(false)
+                        .build(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
 
-                slide.elements.forEach { element ->
-                    val xDp = canvasWidth * element.xFraction
-                    val yDp = canvasHeight * element.yFraction
-                    val wDp = canvasWidth * element.widthFraction
-                    val hDp = canvasHeight * element.heightFraction
+            slide.elements.forEach { element ->
+                val xDp = canvasWidth * element.xFraction
+                val yDp = canvasHeight * element.yFraction
+                val wDp = canvasWidth * element.widthFraction
+                val hDp = canvasHeight * element.heightFraction
 
-                    when (element) {
-                        is SlideElement.ImageElement -> {
-                            AsyncImage(
-                                model = ImageRequest.Builder(context)
-                                    .data(File(element.imagePath))
-                                    .crossfade(false)
-                                    .build(),
-                                contentDescription = "Slide image",
-                                contentScale = ContentScale.FillBounds,
-                                modifier = Modifier
-                                    .offset(x = xDp, y = yDp)
-                                    .size(width = wDp, height = hDp)
-                            )
+                when (element) {
+                    is SlideElement.ImageElement -> {
+                        AsyncImage(
+                            model = ImageRequest.Builder(context)
+                                .data(File(element.imagePath))
+                                .crossfade(false)
+                                .build(),
+                            contentDescription = "Slide image",
+                            contentScale = ContentScale.FillBounds,
+                            modifier = Modifier
+                                .offset(x = xDp, y = yDp)
+                                .size(width = wDp, height = hDp)
+                        )
+                    }
+
+                    is SlideElement.ShapeTextElement -> {
+                        val fill = element.fillColorArgb?.let { Color(it) } ?: Color.Transparent
+                        val borderMod = element.borderColorArgb?.let { argb ->
+                            Modifier.border(0.75.dp, Color(argb))
+                        } ?: Modifier
+
+                        val verticalArrangement = when (element.verticalAlignment) {
+                            SlideVerticalAlignment.CENTER -> Arrangement.Center
+                            SlideVerticalAlignment.BOTTOM -> Arrangement.Bottom
+                            SlideVerticalAlignment.TOP -> Arrangement.Top
                         }
 
-                        is SlideElement.ShapeTextElement -> {
-                            val fill = element.fillColorArgb?.let { Color(it) } ?: Color.Transparent
-                            val borderMod = element.borderColorArgb?.let { argb ->
-                                Modifier.border(0.75.dp, Color(argb))
-                            } ?: Modifier
-
-                            Box(
-                                modifier = Modifier
-                                    .offset(x = xDp, y = yDp)
-                                    .size(width = wDp, height = hDp)
-                                    .background(fill)
-                                    .then(borderMod)
-                                    .padding(horizontal = 2.dp, vertical = 1.dp)
+                        Box(
+                            modifier = Modifier
+                                .offset(x = xDp, y = yDp)
+                                .size(width = wDp, height = hDp)
+                                .background(fill)
+                                .then(borderMod)
+                                .padding(horizontal = 2.dp, vertical = 1.dp)
+                        ) {
+                            Column(
+                                modifier = Modifier.fillMaxSize(),
+                                verticalArrangement = verticalArrangement
                             ) {
-                                Column(
-                                    modifier = Modifier.fillMaxSize(),
-                                    verticalArrangement = Arrangement.spacedBy(1.dp)
-                                ) {
-                                    element.paragraphs.forEach { para ->
-                                        val scaledSp = ((para.fontSizePt * ptScale * 0.88f) / fontScale)
-                                            .coerceIn(5.5f, 30f)
-                                        val defaultTextColor = if (isDarkColor(bgColor) && fill == Color.Transparent) {
-                                            Color.White
-                                        } else if (fill != Color.Transparent && isDarkColor(fill)) {
-                                            Color.White
-                                        } else {
-                                            Color(0xFF1A1D21)
-                                        }
-                                        val prefix = if (para.isBullet) "• " else ""
-
-                                        Text(
-                                            text = "$prefix${para.text}",
-                                            color = para.textColorArgb?.let { Color(it) } ?: defaultTextColor,
-                                            fontSize = scaledSp.sp,
-                                            lineHeight = (scaledSp * 1.12f).sp,
-                                            fontWeight = if (para.isBold) FontWeight.Bold else FontWeight.Normal,
-                                            fontStyle = if (para.isItalic) FontStyle.Italic else FontStyle.Normal,
-                                            textAlign = para.alignment.toSlideTextAlign(),
-                                            softWrap = true,
-                                            overflow = TextOverflow.Clip,
-                                            modifier = Modifier.fillMaxWidth()
-                                        )
+                                element.paragraphs.forEach { para ->
+                                    val scaledSp = ((para.fontSizePt * ptScale * 0.88f) / fontScale)
+                                        .coerceIn(5.2f, 30f)
+                                    val defaultTextColor = if (isDarkColor(bgColor) && fill == Color.Transparent) {
+                                        Color.White
+                                    } else if (fill != Color.Transparent && isDarkColor(fill)) {
+                                        Color.White
+                                    } else {
+                                        Color(0xFF1A1D21)
                                     }
+                                    val prefix = if (para.isBullet) "• " else ""
+
+                                    Text(
+                                        text = "$prefix${para.text}",
+                                        color = para.textColorArgb?.let { Color(it) } ?: defaultTextColor,
+                                        fontSize = scaledSp.sp,
+                                        lineHeight = (scaledSp * 1.14f).sp,
+                                        fontWeight = if (para.isBold) FontWeight.Bold else FontWeight.Normal,
+                                        fontStyle = if (para.isItalic) FontStyle.Italic else FontStyle.Normal,
+                                        textAlign = para.alignment.toSlideTextAlign(),
+                                        softWrap = true,
+                                        overflow = TextOverflow.Clip,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(vertical = 0.5.dp)
+                                    )
                                 }
                             }
                         }
+                    }
 
-                        is SlideElement.TableElement -> {
-                            val tableFontSp = ((11f * ptScale * 0.88f) / fontScale).coerceIn(5.5f, 15f)
-                            Surface(
-                                color = Color.White.copy(alpha = 0.94f),
-                                border = BorderStroke(0.5.dp, Color(0xFFCBD5E1)),
-                                modifier = Modifier
-                                    .offset(x = xDp, y = yDp)
-                                    .size(width = wDp, height = hDp)
-                            ) {
-                                Column(modifier = Modifier.fillMaxSize()) {
-                                    element.rows.forEachIndexed { rowIdx, row ->
-                                        Row(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .background(
-                                                    if (rowIdx == 0) Color(0xFFEEF2F7) else Color.Transparent
-                                                )
-                                                .padding(horizontal = 2.dp, vertical = 1.dp),
-                                            horizontalArrangement = Arrangement.spacedBy(3.dp)
-                                        ) {
-                                            row.forEach { cell ->
-                                                Text(
-                                                    text = cell,
-                                                    color = Color(0xFF1A1D21),
-                                                    fontSize = tableFontSp.sp,
-                                                    lineHeight = (tableFontSp * 1.12f).sp,
-                                                    fontWeight = if (rowIdx == 0) FontWeight.Bold else FontWeight.Normal,
-                                                    maxLines = 3,
-                                                    overflow = TextOverflow.Ellipsis,
-                                                    modifier = Modifier.weight(1f)
-                                                )
-                                            }
+                    is SlideElement.TableElement -> {
+                        val tableFontSp = ((11f * ptScale * 0.86f) / fontScale).coerceIn(5f, 15f)
+                        Surface(
+                            color = Color.White.copy(alpha = 0.94f),
+                            border = BorderStroke(0.5.dp, Color(0xFFCBD5E1)),
+                            modifier = Modifier
+                                .offset(x = xDp, y = yDp)
+                                .size(width = wDp, height = hDp)
+                        ) {
+                            Column(modifier = Modifier.fillMaxSize()) {
+                                element.rows.forEachIndexed { rowIdx, row ->
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .background(
+                                                if (rowIdx == 0) Color(0xFFEEF2F7) else Color.Transparent
+                                            )
+                                            .padding(horizontal = 2.dp, vertical = 1.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(3.dp)
+                                    ) {
+                                        row.forEach { cell ->
+                                            Text(
+                                                text = cell,
+                                                color = Color(0xFF1A1D21),
+                                                fontSize = tableFontSp.sp,
+                                                lineHeight = (tableFontSp * 1.12f).sp,
+                                                fontWeight = if (rowIdx == 0) FontWeight.Bold else FontWeight.Normal,
+                                                maxLines = 3,
+                                                overflow = TextOverflow.Ellipsis,
+                                                modifier = Modifier.weight(1f)
+                                            )
                                         }
-                                        HorizontalDivider(color = Color(0xFFE2E8F0), thickness = 0.5.dp)
                                     }
+                                    HorizontalDivider(color = Color(0xFFE2E8F0), thickness = 0.5.dp)
                                 }
                             }
                         }

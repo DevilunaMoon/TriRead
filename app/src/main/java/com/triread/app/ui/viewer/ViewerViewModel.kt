@@ -155,8 +155,8 @@ class ViewerViewModel(
                             blocks = parsed.blocks,
                             initialBlockIndex = initialBlock,
                             pageMetrics = parsed.pageMetrics,
-                            headerText = parsed.headerText,
-                            footerText = parsed.footerText,
+                            header = parsed.header,
+                            footer = parsed.footer,
                             noticeMessage = parsed.noticeMessage
                         )
                     )

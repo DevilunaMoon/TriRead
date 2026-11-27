@@ -132,8 +132,8 @@ fun ViewerScreen(
                     blocks = content.blocks,
                     initialBlockIndex = content.initialBlockIndex,
                     pageMetrics = content.pageMetrics,
-                    headerText = content.headerText,
-                    footerText = content.footerText,
+                    header = content.header,
+                    footer = content.footer,
                     noticeMessage = content.noticeMessage,
                     settings = uiState.typographySettings,
                     isImmersive = uiState.isImmersive,
@@ -146,11 +146,12 @@ fun ViewerScreen(
             is ViewerContentState.PptReady -> {
                 PptViewerContent(
                     slides = content.slides,
-                    initialSlide = content.initialSlide,
+                    initialSlide = uiState.currentPage,
                     slideAspectRatio = content.slideAspectRatio,
                     slideWidthPt = content.slideWidthPt,
                     showSpeakerNotes = uiState.showSpeakerNotes,
                     isLandscape = uiState.isLandscape,
+                    isImmersive = uiState.isImmersive,
                     onSlideChanged = viewModel::onPageChanged,
                     onToggleImmersive = viewModel::toggleImmersiveMode
                 )

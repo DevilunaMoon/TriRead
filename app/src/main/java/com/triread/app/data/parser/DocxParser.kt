@@ -31,10 +31,18 @@ data class DocRun(
     val colorArgb: Long? = null
 )
 
+data class DocHeaderFooter(
+    val lines: List<String> = emptyList(),
+    val imagePaths: List<String> = emptyList()
+) {
+    val isNotEmpty: Boolean
+        get() = lines.isNotEmpty() || imagePaths.isNotEmpty()
+}
+
 data class DocPageMetrics(
-    val widthPt: Float = 612f,       // Default US Letter 8.5in
-    val heightPt: Float = 792f,      // Default US Letter 11in
-    val marginTopPt: Float = 72f,    // Default 1in
+    val widthPt: Float = 612f,
+    val heightPt: Float = 792f,
+    val marginTopPt: Float = 72f,
     val marginBottomPt: Float = 72f,
     val marginLeftPt: Float = 72f,
     val marginRightPt: Float = 72f
@@ -48,8 +56,8 @@ sealed interface DocBlock {
         val runs: List<DocRun>,
         val level: Int,
         val alignment: DocTextAlignment = DocTextAlignment.START,
-        val spaceBeforePt: Float = 10f,
-        val spaceAfterPt: Float = 4f
+        val spaceBeforePt: Float = 8f,
+        val spaceAfterPt: Float = 3f
     ) : DocBlock {
         val plainText: String get() = runs.joinToString("") { it.text }
     }
@@ -61,7 +69,7 @@ sealed interface DocBlock {
         val indentLeftPt: Float = 0f,
         val firstLineIndentPt: Float = 0f,
         val spaceBeforePt: Float = 0f,
-        val spaceAfterPt: Float = 6f
+        val spaceAfterPt: Float = 4f
     ) : DocBlock {
         val plainText: String get() = runs.joinToString("") { it.text }
     }
@@ -78,8 +86,8 @@ sealed interface DocBlock {
 data class ParsedDocumentContent(
     val blocks: List<DocBlock>,
     val pageMetrics: DocPageMetrics = DocPageMetrics(),
-    val headerText: String? = null,
-    val footerText: String? = null,
+    val header: DocHeaderFooter? = null,
+    val footer: DocHeaderFooter? = null,
     val isLegacyFallback: Boolean = false,
     val noticeMessage: String? = null
 )
@@ -102,8 +110,10 @@ class DocxParser(
 
                 var documentXml: ByteArray? = null
                 var documentRelsXml: ByteArray? = null
-                var headerXml: ByteArray? = null
-                var footerXml: ByteArray? = null
+                val headerXmls = mutableMapOf<String, ByteArray>()
+                val headerRels = mutableMapOf<String, ByteArray>()
+                val footerXmls = mutableMapOf<String, ByteArray>()
+                val footerRels = mutableMapOf<String, ByteArray>()
                 val cachedMedia = mutableMapOf<String, String>()
 
                 val stream = context.contentResolver.openInputStream(uri)
@@ -124,11 +134,19 @@ class DocxParser(
                                     lower == "word/_rels/document.xml.rels" -> {
                                         documentRelsXml = readBounded(zip, MAX_RELS_BYTES)
                                     }
-                                    headerXml == null && lower.startsWith("word/header") && lower.endsWith(".xml") -> {
-                                        headerXml = readBounded(zip, MAX_RELS_BYTES)
+                                    lower.startsWith("word/header") && lower.endsWith(".xml") -> {
+                                        headerXmls[lower] = readBounded(zip, MAX_RELS_BYTES)
                                     }
-                                    footerXml == null && lower.startsWith("word/footer") && lower.endsWith(".xml") -> {
-                                        footerXml = readBounded(zip, MAX_RELS_BYTES)
+                                    lower.startsWith("word/_rels/header") && lower.endsWith(".rels") -> {
+                                        val key = lower.replace("/_rels/", "/").removeSuffix(".rels")
+                                        headerRels[key] = readBounded(zip, MAX_RELS_BYTES)
+                                    }
+                                    lower.startsWith("word/footer") && lower.endsWith(".xml") -> {
+                                        footerXmls[lower] = readBounded(zip, MAX_RELS_BYTES)
+                                    }
+                                    lower.startsWith("word/_rels/footer") && lower.endsWith(".rels") -> {
+                                        val key = lower.replace("/_rels/", "/").removeSuffix(".rels")
+                                        footerRels[key] = readBounded(zip, MAX_RELS_BYTES)
                                     }
                                     lower.startsWith("word/media/") && isSupportedImage(lower) -> {
                                         writeMediaToCache(zip, mediaDir, name)?.let { path ->
@@ -145,24 +163,26 @@ class DocxParser(
 
                 val xmlBytes = documentXml
                 if (xmlBytes != null) {
-                    val rels = documentRelsXml?.let { parseRels(it) }.orEmpty()
-                    val headerText = headerXml?.let { extractSimpleXmlText(it) }?.takeIf { it.isNotBlank() }
-                    val footerText = footerXml?.let { extractSimpleXmlText(it) }?.takeIf { it.isNotBlank() }
-                    val (blocks, metrics) = parseWordDocumentXml(xmlBytes, rels, cachedMedia)
+                    val docRels = documentRelsXml?.let { parseRels(it) }.orEmpty()
+                    val (blocks, metrics) = parseWordDocumentXml(xmlBytes, docRels, cachedMedia)
+
+                    val header = resolveHeaderFooter(headerXmls, headerRels, cachedMedia)
+                    val footer = resolveHeaderFooter(footerXmls, footerRels, cachedMedia)
+
                     if (blocks.isEmpty()) {
                         ParsedDocumentContent(
                             blocks = emptyList(),
                             pageMetrics = metrics,
-                            headerText = headerText,
-                            footerText = footerText,
+                            header = header,
+                            footer = footer,
                             noticeMessage = "This document contains no readable text."
                         )
                     } else {
                         ParsedDocumentContent(
                             blocks = blocks,
                             pageMetrics = metrics,
-                            headerText = headerText,
-                            footerText = footerText
+                            header = header,
+                            footer = footer
                         )
                     }
                 } else if (isLegacyDoc) {
@@ -172,6 +192,94 @@ class DocxParser(
                 }
             }
         }
+
+    private fun resolveHeaderFooter(
+        xmlMap: Map<String, ByteArray>,
+        relsMap: Map<String, ByteArray>,
+        cachedMedia: Map<String, String>
+    ): DocHeaderFooter? {
+        if (xmlMap.isEmpty()) return null
+        // Prefer header1/footer1 or the first entry that has images/text
+        val sortedKeys = xmlMap.keys.sorted()
+        val parsedList = sortedKeys.map { key ->
+            val rels = relsMap[key]?.let { parseRels(it) }.orEmpty()
+            parseHeaderFooterXml(xmlMap.getValue(key), rels, cachedMedia)
+        }
+        return parsedList.firstOrNull { it.imagePaths.isNotEmpty() }
+            ?: parsedList.firstOrNull { it.isNotEmpty }
+    }
+
+    private fun parseHeaderFooterXml(
+        xmlBytes: ByteArray,
+        rels: Map<String, String>,
+        cachedMedia: Map<String, String>
+    ): DocHeaderFooter {
+        val lines = mutableListOf<String>()
+        val imagePaths = mutableListOf<String>()
+        val parser = Xml.newPullParser()
+        parser.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, true)
+
+        ByteArrayInputStream(xmlBytes).use { input ->
+            parser.setInput(input, "UTF-8")
+            var eventType = parser.eventType
+            var fallbackDepth = 0
+            var inParagraph = false
+            val currentLine = StringBuilder()
+
+            while (eventType != XmlPullParser.END_DOCUMENT) {
+                val localName = parser.name.orEmpty()
+
+                when (eventType) {
+                    XmlPullParser.START_TAG -> {
+                        if (localName == "Fallback") {
+                            fallbackDepth++
+                        } else if (fallbackDepth == 0) {
+                            when (localName) {
+                                "p" -> {
+                                    inParagraph = true
+                                    currentLine.clear()
+                                }
+                                "t" -> if (inParagraph) {
+                                    currentLine.append(parser.nextText())
+                                }
+                                "tab" -> if (inParagraph) {
+                                    currentLine.append("  ")
+                                }
+                                "blip" -> {
+                                    val rId = findAttributeByLocalName(parser, "embed")
+                                    val path = rId?.let { rels[it] }?.let { cachedMedia[it] }
+                                    if (!path.isNullOrBlank() && path !in imagePaths) {
+                                        imagePaths.add(path)
+                                    }
+                                }
+                                "imagedata" -> {
+                                    val rId = findAttributeByLocalName(parser, "id")
+                                    val path = rId?.let { rels[it] }?.let { cachedMedia[it] }
+                                    if (!path.isNullOrBlank() && path !in imagePaths) {
+                                        imagePaths.add(path)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    XmlPullParser.END_TAG -> {
+                        if (localName == "Fallback" && fallbackDepth > 0) {
+                            fallbackDepth--
+                        } else if (fallbackDepth == 0 && localName == "p" && inParagraph) {
+                            val trimmed = currentLine.toString().trim()
+                            if (trimmed.isNotEmpty() && trimmed !in lines) {
+                                lines.add(trimmed)
+                            }
+                            inParagraph = false
+                        }
+                    }
+                }
+                eventType = parser.next()
+            }
+        }
+        return DocHeaderFooter(lines = lines, imagePaths = imagePaths)
+    }
 
     private fun parseRels(relsBytes: ByteArray): Map<String, String> {
         val map = mutableMapOf<String, String>()
@@ -185,9 +293,10 @@ class DocxParser(
                     val id = parser.getAttributeValue(null, "Id")
                     val target = parser.getAttributeValue(null, "Target")
                     if (!id.isNullOrBlank() && !target.isNullOrBlank()) {
-                        val normalized = target.replace('\\', '/')
+                        val cleaned = target.replace('\\', '/')
+                            .removePrefix("../")
                             .removePrefix("/")
-                            .let { if (it.startsWith("word/")) it else "word/$it" }
+                        val normalized = (if (cleaned.startsWith("word/")) cleaned else "word/$cleaned")
                             .lowercase(Locale.ROOT)
                         map[id] = normalized
                     }
@@ -196,24 +305,6 @@ class DocxParser(
             }
         }
         return map
-    }
-
-    private fun extractSimpleXmlText(xmlBytes: ByteArray): String {
-        val sb = StringBuilder()
-        val parser = Xml.newPullParser()
-        parser.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, true)
-        ByteArrayInputStream(xmlBytes).use { input ->
-            parser.setInput(input, "UTF-8")
-            var eventType = parser.eventType
-            while (eventType != XmlPullParser.END_DOCUMENT) {
-                if (eventType == XmlPullParser.START_TAG && parser.name == "t") {
-                    val t = parser.nextText()
-                    if (t.isNotEmpty()) sb.append(t)
-                }
-                eventType = parser.next()
-            }
-        }
-        return sb.toString().trim()
     }
 
     private suspend fun parseWordDocumentXml(
@@ -230,6 +321,7 @@ class DocxParser(
             parser.setInput(input, "UTF-8")
 
             var eventType = parser.eventType
+            var fallbackDepth = 0
             var inParagraph = false
             var inRun = false
             var inRunProps = false
@@ -244,11 +336,10 @@ class DocxParser(
             var indentLeftPt = 0f
             var firstLineIndentPt = 0f
             var spaceBeforePt = 0f
-            var spaceAfterPt = 6f
+            var spaceAfterPt = 4f
             val paragraphImagePaths = mutableListOf<String>()
             var hasPageBreak = false
 
-            // Per-run state
             val runText = StringBuilder()
             var runBold = false
             var runItalic = false
@@ -264,206 +355,210 @@ class DocxParser(
                 val localName = parser.name.orEmpty()
 
                 when (eventType) {
-                    XmlPullParser.START_TAG -> when (localName) {
-                        "sectPr" -> inSectPr = true
-                        "pgSz" -> if (inSectPr) {
-                            val wTwips = findAttributeByLocalName(parser, "w")?.toFloatOrNull()
-                            val hTwips = findAttributeByLocalName(parser, "h")?.toFloatOrNull()
-                            if (wTwips != null && hTwips != null && wTwips > 0f && hTwips > 0f) {
-                                pageMetrics = pageMetrics.copy(
-                                    widthPt = (wTwips / TWIPS_PER_PT).coerceIn(300f, 1200f),
-                                    heightPt = (hTwips / TWIPS_PER_PT).coerceIn(300f, 1600f)
-                                )
-                            }
-                        }
-                        "pgMar" -> if (inSectPr) {
-                            val top = findAttributeByLocalName(parser, "top")?.toFloatOrNull()?.div(TWIPS_PER_PT)
-                            val bottom = findAttributeByLocalName(parser, "bottom")?.toFloatOrNull()?.div(TWIPS_PER_PT)
-                            val left = findAttributeByLocalName(parser, "left")?.toFloatOrNull()?.div(TWIPS_PER_PT)
-                            val right = findAttributeByLocalName(parser, "right")?.toFloatOrNull()?.div(TWIPS_PER_PT)
-                            pageMetrics = pageMetrics.copy(
-                                marginTopPt = (top ?: pageMetrics.marginTopPt).coerceIn(18f, 144f),
-                                marginBottomPt = (bottom ?: pageMetrics.marginBottomPt).coerceIn(18f, 144f),
-                                marginLeftPt = (left ?: pageMetrics.marginLeftPt).coerceIn(18f, 144f),
-                                marginRightPt = (right ?: pageMetrics.marginRightPt).coerceIn(18f, 144f)
-                            )
-                        }
-                        "tr" -> {
-                            inTableRow = true
-                            currentRowCells.clear()
-                        }
-                        "tc" -> {
-                            inTableCell = true
-                            currentCellText = StringBuilder()
-                        }
-                        "p" -> {
-                            inParagraph = true
-                            paragraphRuns.clear()
-                            headingLevel = 0
-                            isBullet = false
-                            alignment = DocTextAlignment.START
-                            indentLeftPt = 0f
-                            firstLineIndentPt = 0f
-                            spaceBeforePt = 0f
-                            spaceAfterPt = 6f
-                            paragraphImagePaths.clear()
-                            hasPageBreak = false
-                        }
-                        "pStyle" -> if (inParagraph) {
-                            val styleVal = findAttributeByLocalName(parser, "val")
-                            headingLevel = detectHeadingLevel(styleVal)
-                        }
-                        "jc" -> if (inParagraph) {
-                            alignment = parseAlignment(findAttributeByLocalName(parser, "val"))
-                        }
-                        "ind" -> if (inParagraph) {
-                            findAttributeByLocalName(parser, "left")?.toFloatOrNull()?.let {
-                                indentLeftPt = (it / TWIPS_PER_PT).coerceIn(0f, 180f)
-                            }
-                            findAttributeByLocalName(parser, "firstLine")?.toFloatOrNull()?.let {
-                                firstLineIndentPt = (it / TWIPS_PER_PT).coerceIn(0f, 72f)
-                            }
-                        }
-                        "spacing" -> if (inParagraph) {
-                            findAttributeByLocalName(parser, "before")?.toFloatOrNull()?.let {
-                                spaceBeforePt = (it / TWIPS_PER_PT).coerceIn(0f, 48f)
-                            }
-                            findAttributeByLocalName(parser, "after")?.toFloatOrNull()?.let {
-                                spaceAfterPt = (it / TWIPS_PER_PT).coerceIn(0f, 48f)
-                            }
-                        }
-                        "numPr" -> if (inParagraph) {
-                            isBullet = true
-                        }
-                        "r" -> if (inParagraph) {
-                            inRun = true
-                            runText.clear()
-                            runBold = false
-                            runItalic = false
-                            runUnderline = false
-                            runFontSizePt = null
-                            runColorArgb = null
-                        }
-                        "rPr" -> if (inRun) inRunProps = true
-                        "b" -> if (inRunProps) {
-                            val boldVal = findAttributeByLocalName(parser, "val")
-                            if (boldVal != "0" && boldVal != "false") runBold = true
-                        }
-                        "i" -> if (inRunProps) {
-                            val italicVal = findAttributeByLocalName(parser, "val")
-                            if (italicVal != "0" && italicVal != "false") runItalic = true
-                        }
-                        "u" -> if (inRunProps) {
-                            val uVal = findAttributeByLocalName(parser, "val")
-                            if (uVal != "none") runUnderline = true
-                        }
-                        "sz" -> if (inRunProps) {
-                            // Word w:sz is stored in half-points (e.g. 24 = 12pt).
-                            findAttributeByLocalName(parser, "val")?.toFloatOrNull()?.let { halfPts ->
-                                if (halfPts > 0f) runFontSizePt = (halfPts / 2f).coerceIn(7f, 48f)
-                            }
-                        }
-                        "color" -> if (inRunProps) {
-                            val hex = findAttributeByLocalName(parser, "val")
-                            if (!hex.isNullOrBlank() && hex.length == 6 && !hex.equals("auto", ignoreCase = true)) {
-                                hex.toLongOrNull(16)?.let { rgb -> runColorArgb = 0xFF000000L or rgb }
-                            }
-                        }
-                        "tab" -> if (inRun) {
-                            runText.append("    ")
-                        }
-                        "br" -> if (inParagraph) {
-                            val brType = findAttributeByLocalName(parser, "type")
-                            if (brType.equals("page", ignoreCase = true)) {
-                                hasPageBreak = true
-                            } else if (inRun) {
-                                runText.append("\n")
-                            }
-                        }
-                        "blip" -> if (inParagraph) {
-                            val rId = findAttributeByLocalName(parser, "embed")
-                            val target = rId?.let { rels[it] }
-                            val path = target?.let { cachedMedia[it] }
-                            if (!path.isNullOrBlank()) {
-                                paragraphImagePaths.add(path)
-                            }
-                        }
-                        "t" -> if (inRun) {
-                            val text = parser.nextText()
-                            if (text.isNotEmpty()) {
-                                runText.append(text)
+                    XmlPullParser.START_TAG -> {
+                        if (localName == "Fallback") {
+                            fallbackDepth++
+                        } else if (fallbackDepth == 0) {
+                            when (localName) {
+                                "sectPr" -> inSectPr = true
+                                "pgSz" -> if (inSectPr) {
+                                    val wTwips = findAttributeByLocalName(parser, "w")?.toFloatOrNull()
+                                    val hTwips = findAttributeByLocalName(parser, "h")?.toFloatOrNull()
+                                    if (wTwips != null && hTwips != null && wTwips > 0f && hTwips > 0f) {
+                                        pageMetrics = pageMetrics.copy(
+                                            widthPt = (wTwips / TWIPS_PER_PT).coerceIn(300f, 1200f),
+                                            heightPt = (hTwips / TWIPS_PER_PT).coerceIn(300f, 1600f)
+                                        )
+                                    }
+                                }
+                                "pgMar" -> if (inSectPr) {
+                                    val top = findAttributeByLocalName(parser, "top")?.toFloatOrNull()?.div(TWIPS_PER_PT)
+                                    val bottom = findAttributeByLocalName(parser, "bottom")?.toFloatOrNull()?.div(TWIPS_PER_PT)
+                                    val left = findAttributeByLocalName(parser, "left")?.toFloatOrNull()?.div(TWIPS_PER_PT)
+                                    val right = findAttributeByLocalName(parser, "right")?.toFloatOrNull()?.div(TWIPS_PER_PT)
+                                    pageMetrics = pageMetrics.copy(
+                                        marginTopPt = (top ?: pageMetrics.marginTopPt).coerceIn(18f, 144f),
+                                        marginBottomPt = (bottom ?: pageMetrics.marginBottomPt).coerceIn(18f, 144f),
+                                        marginLeftPt = (left ?: pageMetrics.marginLeftPt).coerceIn(18f, 144f),
+                                        marginRightPt = (right ?: pageMetrics.marginRightPt).coerceIn(18f, 144f)
+                                    )
+                                }
+                                "tr" -> {
+                                    inTableRow = true
+                                    currentRowCells.clear()
+                                }
+                                "tc" -> {
+                                    inTableCell = true
+                                    currentCellText = StringBuilder()
+                                }
+                                "p" -> {
+                                    inParagraph = true
+                                    paragraphRuns.clear()
+                                    headingLevel = 0
+                                    isBullet = false
+                                    alignment = DocTextAlignment.START
+                                    indentLeftPt = 0f
+                                    firstLineIndentPt = 0f
+                                    spaceBeforePt = 0f
+                                    spaceAfterPt = 4f
+                                    paragraphImagePaths.clear()
+                                    hasPageBreak = false
+                                }
+                                "pStyle" -> if (inParagraph) {
+                                    val styleVal = findAttributeByLocalName(parser, "val")
+                                    headingLevel = detectHeadingLevel(styleVal)
+                                }
+                                "jc" -> if (inParagraph) {
+                                    alignment = parseAlignment(findAttributeByLocalName(parser, "val"))
+                                }
+                                "ind" -> if (inParagraph) {
+                                    findAttributeByLocalName(parser, "left")?.toFloatOrNull()?.let {
+                                        indentLeftPt = (it / TWIPS_PER_PT).coerceIn(0f, 180f)
+                                    }
+                                    findAttributeByLocalName(parser, "firstLine")?.toFloatOrNull()?.let {
+                                        firstLineIndentPt = (it / TWIPS_PER_PT).coerceIn(0f, 72f)
+                                    }
+                                }
+                                "spacing" -> if (inParagraph) {
+                                    findAttributeByLocalName(parser, "before")?.toFloatOrNull()?.let {
+                                        spaceBeforePt = (it / TWIPS_PER_PT).coerceIn(0f, 36f)
+                                    }
+                                    findAttributeByLocalName(parser, "after")?.toFloatOrNull()?.let {
+                                        spaceAfterPt = (it / TWIPS_PER_PT).coerceIn(0f, 36f)
+                                    }
+                                }
+                                "numPr" -> if (inParagraph) {
+                                    isBullet = true
+                                }
+                                "r" -> if (inParagraph) {
+                                    inRun = true
+                                    runText.clear()
+                                    runBold = false
+                                    runItalic = false
+                                    runUnderline = false
+                                    runFontSizePt = null
+                                    runColorArgb = null
+                                }
+                                "rPr" -> if (inRun) inRunProps = true
+                                "b" -> if (inRunProps) {
+                                    val boldVal = findAttributeByLocalName(parser, "val")
+                                    if (boldVal != "0" && boldVal != "false") runBold = true
+                                }
+                                "i" -> if (inRunProps) {
+                                    val italicVal = findAttributeByLocalName(parser, "val")
+                                    if (italicVal != "0" && italicVal != "false") runItalic = true
+                                }
+                                "u" -> if (inRunProps) {
+                                    val uVal = findAttributeByLocalName(parser, "val")
+                                    if (uVal != "none") runUnderline = true
+                                }
+                                "sz" -> if (inRunProps) {
+                                    findAttributeByLocalName(parser, "val")?.toFloatOrNull()?.let { halfPts ->
+                                        if (halfPts > 0f) runFontSizePt = (halfPts / 2f).coerceIn(7f, 48f)
+                                    }
+                                }
+                                "color" -> if (inRunProps) {
+                                    val hex = findAttributeByLocalName(parser, "val")
+                                    if (!hex.isNullOrBlank() && hex.length == 6 && !hex.equals("auto", ignoreCase = true)) {
+                                        hex.toLongOrNull(16)?.let { rgb -> runColorArgb = 0xFF000000L or rgb }
+                                    }
+                                }
+                                "tab" -> if (inRun) {
+                                    runText.append("\t")
+                                }
+                                "br" -> if (inParagraph) {
+                                    val brType = findAttributeByLocalName(parser, "type")
+                                    if (brType.equals("page", ignoreCase = true)) {
+                                        hasPageBreak = true
+                                    } else if (inRun) {
+                                        runText.append("\n")
+                                    }
+                                }
+                                "blip" -> if (inParagraph) {
+                                    val rId = findAttributeByLocalName(parser, "embed")
+                                    val path = rId?.let { rels[it] }?.let { cachedMedia[it] }
+                                    if (!path.isNullOrBlank()) paragraphImagePaths.add(path)
+                                }
+                                "t" -> if (inRun) {
+                                    val text = parser.nextText()
+                                    if (text.isNotEmpty()) runText.append(text)
+                                }
                             }
                         }
                     }
 
-                    XmlPullParser.END_TAG -> when (localName) {
-                        "sectPr" -> inSectPr = false
-                        "rPr" -> inRunProps = false
-                        "r" -> if (inRun) {
-                            val text = runText.toString()
-                            if (text.isNotEmpty()) {
-                                paragraphRuns.add(
-                                    DocRun(
-                                        text = text,
-                                        isBold = runBold,
-                                        isItalic = runItalic,
-                                        isUnderline = runUnderline,
-                                        fontSizePt = runFontSizePt,
-                                        colorArgb = runColorArgb
-                                    )
-                                )
-                            }
-                            inRun = false
-                        }
-                        "p" -> if (inParagraph) {
-                            val combined = paragraphRuns.joinToString("") { it.text }.trim()
-                            if (combined.isNotEmpty()) {
-                                if (inTableCell) {
-                                    if (currentCellText.isNotEmpty()) currentCellText.append("\n")
-                                    currentCellText.append(combined)
-                                } else if (headingLevel > 0) {
-                                    blocks.add(
-                                        DocBlock.Heading(
-                                            runs = paragraphRuns.toList(),
-                                            level = headingLevel,
-                                            alignment = alignment,
-                                            spaceBeforePt = spaceBeforePt.coerceAtLeast(8f),
-                                            spaceAfterPt = spaceAfterPt
+                    XmlPullParser.END_TAG -> {
+                        if (localName == "Fallback" && fallbackDepth > 0) {
+                            fallbackDepth--
+                        } else if (fallbackDepth == 0) {
+                            when (localName) {
+                                "sectPr" -> inSectPr = false
+                                "rPr" -> inRunProps = false
+                                "r" -> if (inRun) {
+                                    val text = runText.toString()
+                                    if (text.isNotEmpty()) {
+                                        paragraphRuns.add(
+                                            DocRun(
+                                                text = text,
+                                                isBold = runBold,
+                                                isItalic = runItalic,
+                                                isUnderline = runUnderline,
+                                                fontSizePt = runFontSizePt,
+                                                colorArgb = runColorArgb
+                                            )
                                         )
-                                    )
-                                } else {
-                                    blocks.add(
-                                        DocBlock.Paragraph(
-                                            runs = paragraphRuns.toList(),
-                                            isBullet = isBullet,
-                                            alignment = alignment,
-                                            indentLeftPt = indentLeftPt,
-                                            firstLineIndentPt = firstLineIndentPt,
-                                            spaceBeforePt = spaceBeforePt,
-                                            spaceAfterPt = spaceAfterPt
-                                        )
-                                    )
+                                    }
+                                    inRun = false
+                                }
+                                "p" -> if (inParagraph) {
+                                    val combined = paragraphRuns.joinToString("") { it.text }.trim()
+                                    if (combined.isNotEmpty()) {
+                                        if (inTableCell) {
+                                            if (currentCellText.isNotEmpty()) currentCellText.append("\n")
+                                            currentCellText.append(combined)
+                                        } else if (headingLevel > 0) {
+                                            blocks.add(
+                                                DocBlock.Heading(
+                                                    runs = paragraphRuns.toList(),
+                                                    level = headingLevel,
+                                                    alignment = alignment,
+                                                    spaceBeforePt = spaceBeforePt.coerceAtLeast(6f),
+                                                    spaceAfterPt = spaceAfterPt
+                                                )
+                                            )
+                                        } else {
+                                            blocks.add(
+                                                DocBlock.Paragraph(
+                                                    runs = paragraphRuns.toList(),
+                                                    isBullet = isBullet,
+                                                    alignment = alignment,
+                                                    indentLeftPt = indentLeftPt,
+                                                    firstLineIndentPt = firstLineIndentPt,
+                                                    spaceBeforePt = spaceBeforePt,
+                                                    spaceAfterPt = spaceAfterPt
+                                                )
+                                            )
+                                        }
+                                    }
+                                    if (!inTableCell) {
+                                        paragraphImagePaths.forEach { imgPath ->
+                                            blocks.add(DocBlock.ImageBlock(imgPath))
+                                        }
+                                        if (hasPageBreak) blocks.add(DocBlock.PageBreak)
+                                    }
+                                    inParagraph = false
+                                }
+                                "tc" -> if (inTableCell) {
+                                    currentRowCells.add(currentCellText.toString().trim())
+                                    inTableCell = false
+                                }
+                                "tr" -> if (inTableRow) {
+                                    if (currentRowCells.any { it.isNotEmpty() }) {
+                                        blocks.add(DocBlock.TableRow(currentRowCells.toList()))
+                                    }
+                                    inTableRow = false
                                 }
                             }
-                            if (!inTableCell) {
-                                paragraphImagePaths.forEach { imgPath ->
-                                    blocks.add(DocBlock.ImageBlock(imgPath))
-                                }
-                                if (hasPageBreak) {
-                                    blocks.add(DocBlock.PageBreak)
-                                }
-                            }
-                            inParagraph = false
-                        }
-                        "tc" -> if (inTableCell) {
-                            currentRowCells.add(currentCellText.toString().trim())
-                            inTableCell = false
-                        }
-                        "tr" -> if (inTableRow) {
-                            if (currentRowCells.any { it.isNotEmpty() }) {
-                                blocks.add(DocBlock.TableRow(currentRowCells.toList()))
-                            }
-                            inTableRow = false
                         }
                     }
                 }
