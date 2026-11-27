@@ -199,6 +199,8 @@ class ViewerViewModel(
                         contentState = ViewerContentState.PptReady(
                             slides = parsed.slides,
                             initialSlide = restoredSlide,
+                            slideAspectRatio = parsed.aspectRatio,
+                            slideWidthPt = parsed.slideWidthPt,
                             noticeMessage = parsed.noticeMessage
                         )
                     )
@@ -244,6 +246,16 @@ class ViewerViewModel(
         }
     }
 
+    fun onDocPrintPageChanged(pageIndex: Int, totalPrintPages: Int) {
+        val total = totalPrintPages.coerceAtLeast(1)
+        val clamped = pageIndex.coerceIn(0, total - 1)
+        val state = _uiState.value
+        if (clamped != state.currentPage || total != state.totalPages) {
+            _uiState.update { it.copy(currentPage = clamped, totalPages = total) }
+            persistProgressAsync(clamped, total)
+        }
+    }
+
     fun persistProgressNow() {
         val state = _uiState.value
         if (state.document == null || state.totalPages <= 0) return
@@ -258,12 +270,49 @@ class ViewerViewModel(
         }
     }
 
+    fun togglePdfReadingMode() {
+        _uiState.update { state ->
+            val nextMode = if (state.pdfReadingMode == PdfReadingMode.VERTICAL_SCROLL) {
+                PdfReadingMode.HORIZONTAL_PAGED
+            } else {
+                PdfReadingMode.VERTICAL_SCROLL
+            }
+            state.copy(pdfReadingMode = nextMode)
+        }
+        if (_uiState.value.contentState is ViewerContentState.PdfReady) {
+            updatePdfWindow(_uiState.value.currentPage, lastRenderWidthPx)
+        }
+    }
+
+    fun toggleLandscape() {
+        _uiState.update { it.copy(isLandscape = !it.isLandscape) }
+    }
+
+    fun toggleFullscreenHorizontal() {
+        _uiState.update { state ->
+            val entering = !state.isLandscape
+            state.copy(
+                isLandscape = entering,
+                isImmersive = entering,
+                showSettingsSheet = false
+            )
+        }
+    }
+
     fun toggleImmersiveMode() {
         _uiState.update {
             val nextImmersive = !it.isImmersive
             it.copy(
                 isImmersive = nextImmersive,
                 showSettingsSheet = if (nextImmersive) false else it.showSettingsSheet
+            )
+        }
+    }
+
+    fun togglePrintLayout(enabled: Boolean) {
+        _uiState.update { state ->
+            state.copy(
+                typographySettings = state.typographySettings.copy(isPrintLayout = enabled)
             )
         }
     }
@@ -308,25 +357,26 @@ class ViewerViewModel(
         }
     }
 
-    /**
-     * Lazy page buffer: keeps only [centerPage - 1, centerPage, centerPage + 1] in memory.
-     * Emits the pruned map before recycling evicted bitmaps so Compose never draws a recycled bitmap.
-     */
     private fun updatePdfWindow(centerPage: Int, renderWidthPx: Int) {
         val session = pdfSession ?: return
         val total = session.pageCount
         if (total <= 0) return
 
+        val radius = if (_uiState.value.pdfReadingMode == PdfReadingMode.VERTICAL_SCROLL) 2 else 1
+
         pdfRenderJob?.cancel()
         pdfRenderJob = viewModelScope.launch {
-            val window = ((centerPage - 1).coerceAtLeast(0)..(centerPage + 1).coerceAtMost(total - 1))
+            val window = ((centerPage - radius).coerceAtLeast(0)..(centerPage + radius).coerceAtMost(total - 1))
                 .toSet()
 
-            // Prioritize current page first, then next page, then previous page.
-            val renderOrder = listOf(centerPage, centerPage + 1, centerPage - 1)
-                .filter { it in window }
+            val renderOrder = buildList {
+                add(centerPage)
+                for (offset in 1..radius) {
+                    if (centerPage + offset in window) add(centerPage + offset)
+                    if (centerPage - offset in window) add(centerPage - offset)
+                }
+            }
 
-            // Evict off-window bitmaps from state first, then recycle after a frame delay.
             val evicted = mutableListOf<Bitmap>()
             val iterator = pdfBitmapCache.entries.iterator()
             while (iterator.hasNext()) {
@@ -418,4 +468,3 @@ class ViewerViewModel(
         }
     }
 }
-

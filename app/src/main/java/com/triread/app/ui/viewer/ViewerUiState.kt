@@ -6,6 +6,11 @@ import com.triread.app.data.parser.DocBlock
 import com.triread.app.data.parser.SlideItem
 import com.triread.app.domain.model.DocumentItem
 
+enum class PdfReadingMode(val label: String) {
+    VERTICAL_SCROLL("Vertical Scroll"),
+    HORIZONTAL_PAGED("Horizontal Tap")
+}
+
 enum class ReaderTheme(
     val label: String,
     val backgroundColor: Color,
@@ -39,7 +44,8 @@ enum class ReaderTheme(
 data class ReaderTypographySettings(
     val fontSizeSp: Float = 17f,
     val lineHeightMultiplier: Float = 1.55f,
-    val theme: ReaderTheme = ReaderTheme.DAY
+    val theme: ReaderTheme = ReaderTheme.DAY,
+    val isPrintLayout: Boolean = false
 )
 
 sealed interface ViewerContentState {
@@ -60,6 +66,8 @@ sealed interface ViewerContentState {
     data class PptReady(
         val slides: List<SlideItem>,
         val initialSlide: Int,
+        val slideAspectRatio: Float,
+        val slideWidthPt: Float,
         val noticeMessage: String? = null
     ) : ViewerContentState
 
@@ -74,9 +82,10 @@ data class ViewerUiState(
     val contentState: ViewerContentState = ViewerContentState.Loading,
     val currentPage: Int = 0,
     val totalPages: Int = 0,
+    val pdfReadingMode: PdfReadingMode = PdfReadingMode.VERTICAL_SCROLL,
+    val isLandscape: Boolean = false,
     val isImmersive: Boolean = false,
     val showSettingsSheet: Boolean = false,
     val showSpeakerNotes: Boolean = false,
     val typographySettings: ReaderTypographySettings = ReaderTypographySettings()
 )
-

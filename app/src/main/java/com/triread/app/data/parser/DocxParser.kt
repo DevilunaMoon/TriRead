@@ -3,6 +3,7 @@ package com.triread.app.data.parser
 import android.content.Context
 import android.net.Uri
 import android.util.Xml
+import com.triread.app.util.IoExtensions
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
@@ -10,20 +11,39 @@ import kotlinx.coroutines.withContext
 import org.xmlpull.v1.XmlPullParser
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
 import java.util.Locale
 import java.util.zip.ZipInputStream
 import kotlin.coroutines.coroutineContext
 
+enum class DocTextAlignment {
+    START, CENTER, END, JUSTIFY
+}
+
 sealed interface DocBlock {
-    data class Heading(val text: String, val level: Int) : DocBlock
+    data class Heading(
+        val text: String,
+        val level: Int,
+        val alignment: DocTextAlignment = DocTextAlignment.START
+    ) : DocBlock
+
     data class Paragraph(
         val text: String,
         val isBold: Boolean = false,
-        val isBullet: Boolean = false
+        val isItalic: Boolean = false,
+        val isBullet: Boolean = false,
+        val alignment: DocTextAlignment = DocTextAlignment.START
+    ) : DocBlock
+
+    data class ImageBlock(
+        val imagePath: String
     ) : DocBlock
 
     data class TableRow(val cells: List<String>) : DocBlock
+
+    data object PageBreak : DocBlock
 }
 
 data class ParsedDocumentContent(
@@ -43,9 +63,50 @@ class DocxParser(
                 val uri = Uri.parse(uriString)
                 val isLegacyDoc = fileName.lowercase(Locale.ROOT).endsWith(".doc")
 
-                val xmlBytes = extractDocumentXml(uri)
+                val mediaDir = File(
+                    File(context.cacheDir, DOC_MEDIA_DIR),
+                    IoExtensions.sha256Hex(uriString)
+                ).apply { if (!exists()) mkdirs() }
+
+                var documentXml: ByteArray? = null
+                var documentRelsXml: ByteArray? = null
+                val cachedMedia = mutableMapOf<String, String>()
+
+                val stream = context.contentResolver.openInputStream(uri)
+                    ?: throw IOException("Unable to read document. File may have been moved or permission revoked.")
+
+                stream.use { raw ->
+                    ZipInputStream(raw).use { zip ->
+                        var entry = zip.nextEntry
+                        while (entry != null) {
+                            coroutineContext.ensureActive()
+                            val name = entry.name
+                            if (!entry.isDirectory) {
+                                when {
+                                    name.equals("word/document.xml", ignoreCase = true) -> {
+                                        documentXml = readBounded(zip, MAX_XML_BYTES)
+                                    }
+                                    name.equals("word/_rels/document.xml.rels", ignoreCase = true) -> {
+                                        documentRelsXml = readBounded(zip, MAX_RELS_BYTES)
+                                    }
+                                    name.startsWith("word/media/", ignoreCase = true) &&
+                                        isSupportedImage(name) -> {
+                                        writeMediaToCache(zip, mediaDir, name)?.let { path ->
+                                            cachedMedia[name.lowercase(Locale.ROOT)] = path
+                                        }
+                                    }
+                                }
+                            }
+                            zip.closeEntry()
+                            entry = zip.nextEntry
+                        }
+                    }
+                }
+
+                val xmlBytes = documentXml
                 if (xmlBytes != null) {
-                    val blocks = parseWordDocumentXml(xmlBytes)
+                    val rels = documentRelsXml?.let { parseRels(it) }.orEmpty()
+                    val blocks = parseWordDocumentXml(xmlBytes, rels, cachedMedia)
                     if (blocks.isEmpty()) {
                         ParsedDocumentContent(
                             blocks = emptyList(),
@@ -62,29 +123,36 @@ class DocxParser(
             }
         }
 
-    private suspend fun extractDocumentXml(uri: Uri): ByteArray? {
-        val stream = context.contentResolver.openInputStream(uri)
-            ?: throw IOException("Unable to read document. File may have been moved or permission revoked.")
-
-        stream.use { raw ->
-            ZipInputStream(raw).use { zip ->
-                var entry = zip.nextEntry
-                while (entry != null) {
-                    coroutineContext.ensureActive()
-                    if (!entry.isDirectory && entry.name.equals("word/document.xml", ignoreCase = true)) {
-                        val bytes = readBounded(zip, MAX_XML_BYTES)
-                        zip.closeEntry()
-                        return bytes
+    private fun parseRels(relsBytes: ByteArray): Map<String, String> {
+        val map = mutableMapOf<String, String>()
+        val parser = Xml.newPullParser()
+        parser.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, false)
+        ByteArrayInputStream(relsBytes).use { input ->
+            parser.setInput(input, "UTF-8")
+            var eventType = parser.eventType
+            while (eventType != XmlPullParser.END_DOCUMENT) {
+                if (eventType == XmlPullParser.START_TAG && parser.name == "Relationship") {
+                    val id = parser.getAttributeValue(null, "Id")
+                    val target = parser.getAttributeValue(null, "Target")
+                    if (!id.isNullOrBlank() && !target.isNullOrBlank()) {
+                        val normalized = target.replace('\\', '/')
+                            .removePrefix("/")
+                            .let { if (it.startsWith("word/")) it else "word/$it" }
+                            .lowercase(Locale.ROOT)
+                        map[id] = normalized
                     }
-                    zip.closeEntry()
-                    entry = zip.nextEntry
                 }
+                eventType = parser.next()
             }
         }
-        return null
+        return map
     }
 
-    private suspend fun parseWordDocumentXml(xmlBytes: ByteArray): List<DocBlock> {
+    private suspend fun parseWordDocumentXml(
+        xmlBytes: ByteArray,
+        rels: Map<String, String>,
+        cachedMedia: Map<String, String>
+    ): List<DocBlock> {
         val blocks = mutableListOf<DocBlock>()
         val parser = Xml.newPullParser()
         parser.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, true)
@@ -101,6 +169,11 @@ class DocxParser(
             var headingLevel = 0
             var isBullet = false
             var hasBoldRun = false
+            var hasItalicRun = false
+            var alignment = DocTextAlignment.START
+            val paragraphImagePaths = mutableListOf<String>()
+            var hasPageBreak = false
+
             var currentCellText = StringBuilder()
             val currentRowCells = mutableListOf<String>()
 
@@ -124,11 +197,17 @@ class DocxParser(
                             headingLevel = 0
                             isBullet = false
                             hasBoldRun = false
+                            hasItalicRun = false
+                            alignment = DocTextAlignment.START
+                            paragraphImagePaths.clear()
+                            hasPageBreak = false
                         }
                         "pStyle" -> if (inParagraph) {
-                            val styleVal = parser.getAttributeValue(null, "val")
-                                ?: findAttributeByLocalName(parser, "val")
+                            val styleVal = findAttributeByLocalName(parser, "val")
                             headingLevel = detectHeadingLevel(styleVal)
+                        }
+                        "jc" -> if (inParagraph) {
+                            alignment = parseAlignment(findAttributeByLocalName(parser, "val"))
                         }
                         "numPr" -> if (inParagraph) {
                             isBullet = true
@@ -136,15 +215,30 @@ class DocxParser(
                         "rPr" -> inRunProps = true
                         "b" -> if (inRunProps) {
                             val boldVal = findAttributeByLocalName(parser, "val")
-                            if (boldVal != "0" && boldVal != "false") {
-                                hasBoldRun = true
-                            }
+                            if (boldVal != "0" && boldVal != "false") hasBoldRun = true
+                        }
+                        "i" -> if (inRunProps) {
+                            val italicVal = findAttributeByLocalName(parser, "val")
+                            if (italicVal != "0" && italicVal != "false") hasItalicRun = true
                         }
                         "tab" -> if (inParagraph) {
                             paragraphText.append("    ")
                         }
                         "br" -> if (inParagraph) {
-                            paragraphText.append("\n")
+                            val brType = findAttributeByLocalName(parser, "type")
+                            if (brType.equals("page", ignoreCase = true)) {
+                                hasPageBreak = true
+                            } else {
+                                paragraphText.append("\n")
+                            }
+                        }
+                        "blip" -> if (inParagraph) {
+                            val rId = findAttributeByLocalName(parser, "embed")
+                            val target = rId?.let { rels[it] }
+                            val path = target?.let { cachedMedia[it] }
+                            if (!path.isNullOrBlank()) {
+                                paragraphImagePaths.add(path)
+                            }
                         }
                         "t" -> if (inParagraph) {
                             val text = parser.nextText()
@@ -163,15 +257,31 @@ class DocxParser(
                                     if (currentCellText.isNotEmpty()) currentCellText.append("\n")
                                     currentCellText.append(text)
                                 } else if (headingLevel > 0) {
-                                    blocks.add(DocBlock.Heading(text = text, level = headingLevel))
+                                    blocks.add(
+                                        DocBlock.Heading(
+                                            text = text,
+                                            level = headingLevel,
+                                            alignment = alignment
+                                        )
+                                    )
                                 } else {
                                     blocks.add(
                                         DocBlock.Paragraph(
                                             text = text,
                                             isBold = hasBoldRun,
-                                            isBullet = isBullet
+                                            isItalic = hasItalicRun,
+                                            isBullet = isBullet,
+                                            alignment = alignment
                                         )
                                     )
+                                }
+                            }
+                            if (!inTableCell) {
+                                paragraphImagePaths.forEach { imgPath ->
+                                    blocks.add(DocBlock.ImageBlock(imgPath))
+                                }
+                                if (hasPageBreak) {
+                                    blocks.add(DocBlock.PageBreak)
                                 }
                             }
                             inParagraph = false
@@ -192,6 +302,13 @@ class DocxParser(
             }
         }
         return blocks
+    }
+
+    private fun parseAlignment(value: String?): DocTextAlignment = when (value?.lowercase(Locale.ROOT)) {
+        "center" -> DocTextAlignment.CENTER
+        "right", "end" -> DocTextAlignment.END
+        "both", "distribute" -> DocTextAlignment.JUSTIFY
+        else -> DocTextAlignment.START
     }
 
     private fun parseLegacyBinaryDoc(uri: Uri): ParsedDocumentContent {
@@ -228,17 +345,13 @@ class DocxParser(
                 current.append(ch.toChar())
             } else if ((ch == 10 || ch == 13) && current.length >= 24) {
                 val candidate = current.toString().trim()
-                if (isLikelyNaturalText(candidate)) {
-                    paragraphs.add(candidate)
-                }
+                if (isLikelyNaturalText(candidate)) paragraphs.add(candidate)
                 current.clear()
                 if (paragraphs.size >= MAX_LEGACY_PARAGRAPHS) break
             } else {
                 if (current.length >= 40) {
                     val candidate = current.toString().trim()
-                    if (isLikelyNaturalText(candidate)) {
-                        paragraphs.add(candidate)
-                    }
+                    if (isLikelyNaturalText(candidate)) paragraphs.add(candidate)
                 }
                 current.clear()
                 if (paragraphs.size >= MAX_LEGACY_PARAGRAPHS) break
@@ -273,6 +386,43 @@ class DocxParser(
         return null
     }
 
+    private fun writeMediaToCache(zip: ZipInputStream, dir: File, entryName: String): String? {
+        val safeFileName = entryName.substringAfterLast('/')
+            .replace(Regex("[^A-Za-z0-9._-]"), "_")
+        if (safeFileName.isBlank()) return null
+
+        val outFile = File(dir, safeFileName)
+        if (outFile.exists() && outFile.length() > 0L) {
+            return outFile.absolutePath
+        }
+
+        val buffer = ByteArray(8192)
+        var total = 0
+        FileOutputStream(outFile).use { fos ->
+            while (true) {
+                val read = zip.read(buffer)
+                if (read <= 0) break
+                total += read
+                if (total > MAX_MEDIA_ENTRY_BYTES) {
+                    fos.close()
+                    outFile.delete()
+                    return null
+                }
+                fos.write(buffer, 0, read)
+            }
+        }
+        return outFile.absolutePath
+    }
+
+    private fun isSupportedImage(path: String): Boolean {
+        val lower = path.lowercase(Locale.ROOT)
+        return lower.endsWith(".png") ||
+            lower.endsWith(".jpg") ||
+            lower.endsWith(".jpeg") ||
+            lower.endsWith(".webp") ||
+            lower.endsWith(".gif")
+    }
+
     private fun readBounded(input: java.io.InputStream, maxBytes: Int): ByteArray {
         val buffer = ByteArray(8192)
         val out = ByteArrayOutputStream()
@@ -290,9 +440,11 @@ class DocxParser(
     }
 
     companion object {
-        private const val MAX_XML_BYTES = 16 * 1024 * 1024 // 16 MB safety cap
+        private const val DOC_MEDIA_DIR = "doc_media"
+        private const val MAX_XML_BYTES = 16 * 1024 * 1024
+        private const val MAX_RELS_BYTES = 2 * 1024 * 1024
+        private const val MAX_MEDIA_ENTRY_BYTES = 8 * 1024 * 1024
         private const val MAX_LEGACY_SCAN_BYTES = 2 * 1024 * 1024
         private const val MAX_LEGACY_PARAGRAPHS = 300
     }
 }
-

@@ -14,14 +14,19 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.Article
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.ErrorOutline
+import androidx.compose.material.icons.rounded.Fullscreen
+import androidx.compose.material.icons.rounded.FullscreenExit
+import androidx.compose.material.icons.rounded.ScreenRotation
 import androidx.compose.material.icons.rounded.SpeakerNotes
 import androidx.compose.material.icons.rounded.TextFields
+import androidx.compose.material.icons.rounded.ViewCarousel
+import androidx.compose.material.icons.rounded.ViewStream
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -52,6 +57,7 @@ import com.triread.app.ui.viewer.components.DocSettingsBottomSheet
 import com.triread.app.ui.viewer.components.DocViewerContent
 import com.triread.app.ui.viewer.components.PdfViewerContent
 import com.triread.app.ui.viewer.components.PptViewerContent
+import com.triread.app.util.LockLandscapeEffect
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -62,12 +68,12 @@ fun ViewerScreen(
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val view = LocalView.current
 
-    // Persist reading progress automatically whenever the app pauses or screen is backgrounded.
+    LockLandscapeEffect(isLandscape = uiState.isLandscape)
+
     LifecycleEventEffect(Lifecycle.Event.ON_PAUSE) {
         viewModel.persistProgressNow()
     }
 
-    // Sync Android system bars with distraction-free immersive mode.
     LaunchedEffect(uiState.isImmersive) {
         val window = (view.context as? Activity)?.window ?: return@LaunchedEffect
         val controller = WindowCompat.getInsetsController(window, view)
@@ -111,7 +117,9 @@ fun ViewerScreen(
             is ViewerContentState.PdfReady -> {
                 PdfViewerContent(
                     totalPages = content.totalPages,
-                    initialPage = content.initialPage,
+                    currentPage = uiState.currentPage,
+                    readingMode = uiState.pdfReadingMode,
+                    isImmersive = uiState.isImmersive,
                     renderedPages = content.renderedPages,
                     onPageChanged = viewModel::onPageChanged,
                     onViewportWidthChanged = viewModel::onPdfViewportWidthChanged,
@@ -125,7 +133,9 @@ fun ViewerScreen(
                     initialBlockIndex = content.initialBlockIndex,
                     noticeMessage = content.noticeMessage,
                     settings = uiState.typographySettings,
+                    isImmersive = uiState.isImmersive,
                     onVisibleBlockChanged = viewModel::onDocVisibleBlockChanged,
+                    onPrintPageChanged = viewModel::onDocPrintPageChanged,
                     onToggleImmersive = viewModel::toggleImmersiveMode
                 )
             }
@@ -134,14 +144,17 @@ fun ViewerScreen(
                 PptViewerContent(
                     slides = content.slides,
                     initialSlide = content.initialSlide,
+                    slideAspectRatio = content.slideAspectRatio,
+                    slideWidthPt = content.slideWidthPt,
                     showSpeakerNotes = uiState.showSpeakerNotes,
+                    isLandscape = uiState.isLandscape,
                     onSlideChanged = viewModel::onPageChanged,
                     onToggleImmersive = viewModel::toggleImmersiveMode
                 )
             }
         }
 
-        // Overlay Top Bar (hidden in immersive mode)
+        // Overlay TopAppBar (TopAppBar natively handles statusBars insets so there is no dark gap above it)
         AnimatedVisibility(
             visible = !uiState.isImmersive,
             enter = fadeIn() + slideInVertically { -it },
@@ -149,7 +162,6 @@ fun ViewerScreen(
             modifier = Modifier.align(Alignment.TopCenter)
         ) {
             TopAppBar(
-                modifier = Modifier.statusBarsPadding(),
                 title = {
                     Text(
                         text = uiState.document?.title ?: "Document",
@@ -171,7 +183,52 @@ fun ViewerScreen(
                 },
                 actions = {
                     when (val content = uiState.contentState) {
+                        is ViewerContentState.PdfReady -> {
+                            IconButton(onClick = viewModel::togglePdfReadingMode) {
+                                Icon(
+                                    imageVector = if (uiState.pdfReadingMode == PdfReadingMode.VERTICAL_SCROLL) {
+                                        Icons.Rounded.ViewStream
+                                    } else {
+                                        Icons.Rounded.ViewCarousel
+                                    },
+                                    contentDescription = "Switch scroll / tap mode"
+                                )
+                            }
+                            IconButton(onClick = viewModel::toggleLandscape) {
+                                Icon(
+                                    imageVector = Icons.Rounded.ScreenRotation,
+                                    contentDescription = "Toggle horizontal screen",
+                                    tint = if (uiState.isLandscape) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurface
+                                    }
+                                )
+                            }
+                            IconButton(onClick = viewModel::toggleImmersiveMode) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Fullscreen,
+                                    contentDescription = "Full screen"
+                                )
+                            }
+                        }
+
                         is ViewerContentState.DocReady -> {
+                            IconButton(
+                                onClick = {
+                                    viewModel.togglePrintLayout(!uiState.typographySettings.isPrintLayout)
+                                }
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Article,
+                                    contentDescription = "Toggle Print Layout",
+                                    tint = if (uiState.typographySettings.isPrintLayout) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurface
+                                    }
+                                )
+                            }
                             IconButton(onClick = viewModel::toggleSettingsSheet) {
                                 Icon(
                                     imageVector = Icons.Rounded.TextFields,
@@ -197,18 +254,33 @@ fun ViewerScreen(
                                     )
                                 }
                             }
+                            IconButton(onClick = viewModel::toggleFullscreenHorizontal) {
+                                Icon(
+                                    imageVector = if (uiState.isLandscape) {
+                                        Icons.Rounded.FullscreenExit
+                                    } else {
+                                        Icons.Rounded.Fullscreen
+                                    },
+                                    contentDescription = "Full-screen horizontal presentation",
+                                    tint = if (uiState.isLandscape) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurface
+                                    }
+                                )
+                            }
                         }
 
                         else -> Unit
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f)
+                    containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f)
                 )
             )
         }
 
-        // Overlay Bottom Page / Slide Counter Pill (hidden in immersive mode)
+        // Overlay Bottom Page / Slide Counter Pill
         AnimatedVisibility(
             visible = !uiState.isImmersive && uiState.totalPages > 0 &&
                 uiState.contentState !is ViewerContentState.Error,
@@ -217,7 +289,7 @@ fun ViewerScreen(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .navigationBarsPadding()
-                .padding(bottom = 16.dp)
+                .padding(bottom = 14.dp)
         ) {
             val unitLabel = if (uiState.contentState is ViewerContentState.PptReady) {
                 "Slide"
@@ -225,10 +297,15 @@ fun ViewerScreen(
                 "Page"
             }
             val displayPage = (uiState.currentPage + 1).coerceIn(1, uiState.totalPages)
+            val modeTag = when (uiState.contentState) {
+                is ViewerContentState.PdfReady -> " · ${uiState.pdfReadingMode.label}"
+                is ViewerContentState.DocReady -> if (uiState.typographySettings.isPrintLayout) " · Print" else ""
+                else -> ""
+            }
 
             Surface(
                 shape = RoundedCornerShape(20.dp),
-                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.92f),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f),
                 tonalElevation = 4.dp,
                 shadowElevation = 4.dp
             ) {
@@ -243,7 +320,7 @@ fun ViewerScreen(
                         tint = MaterialTheme.colorScheme.primary
                     )
                     Text(
-                        text = "$unitLabel $displayPage of ${uiState.totalPages}",
+                        text = "$unitLabel $displayPage of ${uiState.totalPages}$modeTag",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurface
                     )
@@ -255,6 +332,7 @@ fun ViewerScreen(
     if (uiState.showSettingsSheet && uiState.contentState is ViewerContentState.DocReady) {
         DocSettingsBottomSheet(
             settings = uiState.typographySettings,
+            onTogglePrintLayout = viewModel::togglePrintLayout,
             onSelectTheme = viewModel::selectReaderTheme,
             onFontSizeChange = viewModel::updateFontSize,
             onLineSpacingChange = viewModel::updateLineSpacing,
@@ -308,4 +386,3 @@ private fun ViewerErrorState(
         }
     }
 }
-
