@@ -7,6 +7,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build Debug & Release APKs
@@ -33,22 +36,35 @@ jobs:
       - name: Build Release APK (R8 minified)
         run: gradle assembleRelease --stacktrace
 
+      - name: Prepare direct APK filename
+        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/TriRead.apk
+
       - name: Print APK sizes
         run: |
           echo "### TriRead APK Build Sizes" >> $GITHUB_STEP_SUMMARY
-          ls -lh app/build/outputs/apk/debug/*.apk app/build/outputs/apk/release/*.apk | awk '{print "- `" $9 "` — **" $5 "**"}' >> $GITHUB_STEP_SUMMARY
+          ls -lh app/build/outputs/apk/debug/TriRead.apk app/build/outputs/apk/release/*.apk | awk '{print "- `" $9 "` — **" $5 "**"}' >> $GITHUB_STEP_SUMMARY
 
-      - name: Upload Debug APK
+      - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: TriRead-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          path: app/build/outputs/apk/debug/TriRead.apk
           if-no-files-found: error
 
-      - name: Upload Release APK (unsigned)
+      - name: Upload Release APK Artifact (unsigned)
         uses: actions/upload-artifact@v4
         with:
           name: TriRead-release-apk
           path: app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
+      - name: Publish direct APK to GitHub Releases
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: TriRead Latest Build
+          body: Direct installable APK build of TriRead (pure Kotlin, 100% offline PDF/DOCX/PPTX reader).
+          make_latest: true
+          files: |
+            app/build/outputs/apk/debug/TriRead.apk
