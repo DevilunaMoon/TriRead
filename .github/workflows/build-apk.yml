@@ -30,6 +30,27 @@ jobs:
         with:
           gradle-version: 8.10.2
 
+      - name: Restore shared debug keystore
+        id: keystore-cache
+        uses: actions/cache@v4
+        with:
+          path: app/debug.keystore
+          key: triread-shared-debug-keystore-v1
+
+      - name: Generate shared debug keystore (first run only)
+        if: steps.keystore-cache.outputs.cache-hit != 'true'
+        run: |
+          keytool -genkeypair -v \
+            -keystore app/debug.keystore \
+            -storetype PKCS12 \
+            -storepass triread123 \
+            -keypass triread123 \
+            -alias trireaddebug \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=TriRead Debug, O=TriRead, C=PH"
+
       - name: Build Debug APK (installable on phone)
         run: gradle assembleDebug --stacktrace
 
