@@ -189,28 +189,40 @@ class DocxParser(
                 if (xmlBytes != null) {
                     val defaultFontFamily = stylesXml?.let { parseDefaultFontFromStyles(it) }
                     val docRels = documentRelsXml?.let { parseRels(it) }.orEmpty()
-                    val (blocks, metrics) = parseWordDocumentXml(
+                    val bodyResult = parseWordDocumentXml(
                         xmlBytes = xmlBytes,
                         rels = docRels,
                         cachedMedia = cachedMedia,
                         defaultFontFamily = defaultFontFamily
                     )
 
-                    val header = resolveHeaderFooter(headerXmls, headerRels, cachedMedia, defaultFontFamily)
-                    val footer = resolveHeaderFooter(footerXmls, footerRels, cachedMedia, defaultFontFamily)
+                    val header = resolveHeaderFooter(
+                        preferredTarget = bodyResult.defaultHeaderTarget,
+                        xmlMap = headerXmls,
+                        relsMap = headerRels,
+                        cachedMedia = cachedMedia,
+                        defaultFontFamily = defaultFontFamily
+                    )
+                    val footer = resolveHeaderFooter(
+                        preferredTarget = bodyResult.defaultFooterTarget,
+                        xmlMap = footerXmls,
+                        relsMap = footerRels,
+                        cachedMedia = cachedMedia,
+                        defaultFontFamily = defaultFontFamily
+                    )
 
-                    if (blocks.isEmpty()) {
+                    if (bodyResult.blocks.isEmpty()) {
                         ParsedDocumentContent(
                             blocks = emptyList(),
-                            pageMetrics = metrics,
+                            pageMetrics = bodyResult.pageMetrics,
                             header = header,
                             footer = footer,
                             noticeMessage = "This document contains no readable text."
                         )
                     } else {
                         ParsedDocumentContent(
-                            blocks = blocks,
-                            pageMetrics = metrics,
+                            blocks = bodyResult.blocks,
+                            pageMetrics = bodyResult.pageMetrics,
                             header = header,
                             footer = footer
                         )
@@ -253,12 +265,21 @@ class DocxParser(
     }
 
     private fun resolveHeaderFooter(
+        preferredTarget: String?,
         xmlMap: Map<String, ByteArray>,
         relsMap: Map<String, ByteArray>,
         cachedMedia: Map<String, String>,
         defaultFontFamily: String?
     ): DocHeaderFooter? {
         if (xmlMap.isEmpty()) return null
+        if (!preferredTarget.isNullOrBlank()) {
+            val targetBytes = xmlMap[preferredTarget]
+            if (targetBytes != null) {
+                val rels = relsMap[preferredTarget]?.let { parseRels(it) }.orEmpty()
+                val parsed = parseHeaderFooterXml(targetBytes, rels, cachedMedia, defaultFontFamily)
+                if (parsed.isNotEmpty) return parsed
+            }
+        }
         val sortedKeys = xmlMap.keys.sorted()
         val parsedList = sortedKeys.map { key ->
             val rels = relsMap[key]?.let { parseRels(it) }.orEmpty()
@@ -268,13 +289,18 @@ class DocxParser(
             ?: parsedList.firstOrNull { it.isNotEmpty }
     }
 
+    private data class RawHeaderElement(
+        val element: HeaderFooterElement,
+        val isBehindDoc: Boolean = false
+    )
+
     private fun parseHeaderFooterXml(
         xmlBytes: ByteArray,
         rels: Map<String, String>,
         cachedMedia: Map<String, String>,
         defaultFontFamily: String?
     ): DocHeaderFooter {
-        val elements = mutableListOf<HeaderFooterElement>()
+        val rawElements = mutableListOf<RawHeaderElement>()
         val seenTextLines = HashSet<String>()
         val seenImages = HashSet<String>()
 
@@ -286,6 +312,9 @@ class DocxParser(
             var eventType = parser.eventType
             var fallbackDepth = 0
             var inParagraph = false
+            var inDrawing = false
+            var drawingHidden = false
+            var drawingBehindDoc = false
             val currentLine = StringBuilder()
             var currentFont: String? = null
             var pendingExtentWidthPt: Float? = null
@@ -305,12 +334,31 @@ class DocxParser(
                                     currentLine.clear()
                                     currentFont = defaultFontFamily
                                 }
+                                "drawing", "pict" -> {
+                                    inDrawing = true
+                                    drawingHidden = false
+                                    drawingBehindDoc = false
+                                    pendingExtentWidthPt = null
+                                    pendingExtentHeightPt = null
+                                }
+                                "anchor" -> if (inDrawing) {
+                                    val behind = findAttributeByLocalName(parser, "behindDoc")
+                                    if (behind == "1" || behind.equals("true", ignoreCase = true)) {
+                                        drawingBehindDoc = true
+                                    }
+                                }
+                                "docPr" -> if (inDrawing) {
+                                    val hidden = findAttributeByLocalName(parser, "hidden")
+                                    if (hidden == "1" || hidden.equals("true", ignoreCase = true)) {
+                                        drawingHidden = true
+                                    }
+                                }
                                 "rFonts" -> if (inParagraph) {
                                     val font = findAttributeByLocalName(parser, "ascii")
                                         ?: findAttributeByLocalName(parser, "hAnsi")
                                     if (!font.isNullOrBlank()) currentFont = font
                                 }
-                                "extent" -> {
+                                "extent" -> if (inDrawing) {
                                     val cx = findAttributeByLocalName(parser, "cx")?.toFloatOrNull()
                                     val cy = findAttributeByLocalName(parser, "cy")?.toFloatOrNull()
                                     if (cx != null && cy != null && cx > 0f && cy > 0f) {
@@ -318,36 +366,42 @@ class DocxParser(
                                         pendingExtentHeightPt = cy / EMU_PER_PT
                                     }
                                 }
-                                "t" -> if (inParagraph) {
+                                "t" -> if (inParagraph && !drawingHidden) {
                                     currentLine.append(parser.nextText())
                                 }
-                                "tab" -> if (inParagraph) {
+                                "tab" -> if (inParagraph && !drawingHidden) {
                                     currentLine.append("  ")
                                 }
-                                "blip" -> {
+                                "blip" -> if (!drawingHidden) {
                                     val rId = findAttributeByLocalName(parser, "embed")
                                     val path = rId?.let { rels[it] }?.let { cachedMedia[it] }
                                     if (!path.isNullOrBlank() && seenImages.add(path)) {
-                                        elements.add(
-                                            HeaderFooterElement.Image(
-                                                imagePath = path,
-                                                widthPt = pendingExtentWidthPt,
-                                                heightPt = pendingExtentHeightPt
+                                        rawElements.add(
+                                            RawHeaderElement(
+                                                element = HeaderFooterElement.Image(
+                                                    imagePath = path,
+                                                    widthPt = pendingExtentWidthPt,
+                                                    heightPt = pendingExtentHeightPt
+                                                ),
+                                                isBehindDoc = drawingBehindDoc
                                             )
                                         )
                                         pendingExtentWidthPt = null
                                         pendingExtentHeightPt = null
                                     }
                                 }
-                                "imagedata" -> {
+                                "imagedata" -> if (!drawingHidden) {
                                     val rId = findAttributeByLocalName(parser, "id")
                                     val path = rId?.let { rels[it] }?.let { cachedMedia[it] }
                                     if (!path.isNullOrBlank() && seenImages.add(path)) {
-                                        elements.add(
-                                            HeaderFooterElement.Image(
-                                                imagePath = path,
-                                                widthPt = pendingExtentWidthPt,
-                                                heightPt = pendingExtentHeightPt
+                                        rawElements.add(
+                                            RawHeaderElement(
+                                                element = HeaderFooterElement.Image(
+                                                    imagePath = path,
+                                                    widthPt = pendingExtentWidthPt,
+                                                    heightPt = pendingExtentHeightPt
+                                                ),
+                                                isBehindDoc = drawingBehindDoc
                                             )
                                         )
                                         pendingExtentWidthPt = null
@@ -361,24 +415,42 @@ class DocxParser(
                     XmlPullParser.END_TAG -> {
                         if (localName == "Fallback" && fallbackDepth > 0) {
                             fallbackDepth--
-                        } else if (fallbackDepth == 0 && localName == "p" && inParagraph) {
-                            val trimmed = currentLine.toString().trim()
-                            if (trimmed.isNotEmpty() && seenTextLines.add(trimmed)) {
-                                elements.add(
-                                    HeaderFooterElement.TextLine(
-                                        text = trimmed,
-                                        fontFamilyName = currentFont
-                                    )
-                                )
+                        } else if (fallbackDepth == 0) {
+                            when (localName) {
+                                "drawing", "pict" -> {
+                                    inDrawing = false
+                                    drawingHidden = false
+                                    drawingBehindDoc = false
+                                }
+                                "p" -> if (inParagraph) {
+                                    val trimmed = currentLine.toString().trim()
+                                    if (trimmed.isNotEmpty() && seenTextLines.add(trimmed)) {
+                                        rawElements.add(
+                                            RawHeaderElement(
+                                                element = HeaderFooterElement.TextLine(
+                                                    text = trimmed,
+                                                    fontFamilyName = currentFont
+                                                )
+                                            )
+                                        )
+                                    }
+                                    inParagraph = false
+                                }
                             }
-                            inParagraph = false
                         }
                     }
                 }
                 eventType = parser.next()
             }
         }
-        return DocHeaderFooter(elements = elements)
+
+        // If foreground header images exist, filter out covered behindDoc="1" template leftovers.
+        val hasForegroundImage = rawElements.any { it.element is HeaderFooterElement.Image && !it.isBehindDoc }
+        val filtered = rawElements.filter { raw ->
+            !(raw.element is HeaderFooterElement.Image && raw.isBehindDoc && hasForegroundImage)
+        }.map { it.element }
+
+        return DocHeaderFooter(elements = filtered)
     }
 
     private fun parseRels(relsBytes: ByteArray): Map<String, String> {
@@ -407,14 +479,23 @@ class DocxParser(
         return map
     }
 
+    private data class ParsedBodyResult(
+        val blocks: List<DocBlock>,
+        val pageMetrics: DocPageMetrics,
+        val defaultHeaderTarget: String?,
+        val defaultFooterTarget: String?
+    )
+
     private suspend fun parseWordDocumentXml(
         xmlBytes: ByteArray,
         rels: Map<String, String>,
         cachedMedia: Map<String, String>,
         defaultFontFamily: String?
-    ): Pair<List<DocBlock>, DocPageMetrics> {
+    ): ParsedBodyResult {
         val blocks = mutableListOf<DocBlock>()
         var pageMetrics = DocPageMetrics()
+        var defaultHeaderTarget: String? = null
+        var defaultFooterTarget: String? = null
 
         val parser = Xml.newPullParser()
         parser.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, true)
@@ -424,6 +505,8 @@ class DocxParser(
             var eventType = parser.eventType
             var fallbackDepth = 0
             var inParagraph = false
+            var inDrawing = false
+            var drawingHidden = false
             var inRun = false
             var inRunProps = false
             var inTableRow = false
@@ -466,6 +549,32 @@ class DocxParser(
                         } else if (fallbackDepth == 0) {
                             when (localName) {
                                 "sectPr" -> inSectPr = true
+                                "headerReference" -> if (inSectPr) {
+                                    val type = findAttributeByLocalName(parser, "type")
+                                    val rId = findAttributeByLocalName(parser, "id")
+                                    val target = rId?.let { rels[it] }
+                                    if (!target.isNullOrBlank() && (defaultHeaderTarget == null || type == "default")) {
+                                        defaultHeaderTarget = target
+                                    }
+                                }
+                                "footerReference" -> if (inSectPr) {
+                                    val type = findAttributeByLocalName(parser, "type")
+                                    val rId = findAttributeByLocalName(parser, "id")
+                                    val target = rId?.let { rels[it] }
+                                    if (!target.isNullOrBlank() && (defaultFooterTarget == null || type == "default")) {
+                                        defaultFooterTarget = target
+                                    }
+                                }
+                                "drawing", "pict" -> if (inParagraph) {
+                                    inDrawing = true
+                                    drawingHidden = false
+                                }
+                                "docPr" -> if (inDrawing) {
+                                    val hidden = findAttributeByLocalName(parser, "hidden")
+                                    if (hidden == "1" || hidden.equals("true", ignoreCase = true)) {
+                                        drawingHidden = true
+                                    }
+                                }
                                 "pgSz" -> if (inSectPr) {
                                     val wTwips = findAttributeByLocalName(parser, "w")?.toFloatOrNull()
                                     val hTwips = findAttributeByLocalName(parser, "h")?.toFloatOrNull()
@@ -592,7 +701,7 @@ class DocxParser(
                                         runText.append("\n")
                                     }
                                 }
-                                "blip" -> if (inParagraph) {
+                                "blip" -> if (inParagraph && !drawingHidden) {
                                     val rId = findAttributeByLocalName(parser, "embed")
                                     val path = rId?.let { rels[it] }?.let { cachedMedia[it] }
                                     if (!path.isNullOrBlank()) {
@@ -621,6 +730,10 @@ class DocxParser(
                         } else if (fallbackDepth == 0) {
                             when (localName) {
                                 "sectPr" -> inSectPr = false
+                                "drawing", "pict" -> {
+                                    inDrawing = false
+                                    drawingHidden = false
+                                }
                                 "rPr" -> inRunProps = false
                                 "r" -> if (inRun) {
                                     val text = runText.toString()
@@ -706,7 +819,12 @@ class DocxParser(
                 eventType = parser.next()
             }
         }
-        return blocks to pageMetrics
+        return ParsedBodyResult(
+            blocks = blocks,
+            pageMetrics = pageMetrics,
+            defaultHeaderTarget = defaultHeaderTarget,
+            defaultFooterTarget = defaultFooterTarget
+        )
     }
 
     private fun parseAlignment(value: String?): DocTextAlignment = when (value?.lowercase(Locale.ROOT)) {
