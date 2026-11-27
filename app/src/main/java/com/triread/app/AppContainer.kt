@@ -7,6 +7,7 @@ import com.triread.app.data.parser.PptxParser
 import com.triread.app.data.repository.DocumentRepositoryImpl
 import com.triread.app.data.scanner.MediaStoreDocumentScanner
 import com.triread.app.data.scanner.ThumbnailGenerator
+import com.triread.app.data.updater.AppUpdateManager
 import com.triread.app.domain.repository.DocumentRepository
 
 class AppContainer(context: Context) {
@@ -31,6 +32,10 @@ class AppContainer(context: Context) {
 
     val pptxParser: PptxParser by lazy {
         PptxParser(appContext)
+    }
+
+    val appUpdateManager: AppUpdateManager by lazy {
+        AppUpdateManager(appContext)
     }
 
     val documentRepository: DocumentRepository by lazy {

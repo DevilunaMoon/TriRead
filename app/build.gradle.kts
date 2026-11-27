@@ -13,12 +13,25 @@ android {
         applicationId = "com.triread.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        val buildNum = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
+        versionCode = buildNum
+        versionName = "1.0.$buildNum"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
+        }
+    }
+
+    signingConfigs {
+        getByName("debug") {
+            val sharedKeystore = file("debug.keystore")
+            if (sharedKeystore.exists()) {
+                storeFile = sharedKeystore
+                storePassword = "triread123"
+                keyAlias = "trireaddebug"
+                keyPassword = "triread123"
+            }
         }
     }
 

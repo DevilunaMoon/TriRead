@@ -12,11 +12,14 @@ import androidx.navigation.navArgument
 import com.triread.app.AppContainer
 import com.triread.app.ui.dashboard.DashboardScreen
 import com.triread.app.ui.dashboard.DashboardViewModel
+import com.triread.app.ui.update.UpdateScreen
+import com.triread.app.ui.update.UpdateViewModel
 import com.triread.app.ui.viewer.ViewerScreen
 import com.triread.app.ui.viewer.ViewerViewModel
 
 object TriReadRoutes {
     const val DASHBOARD = "dashboard"
+    const val UPDATE = "update"
     const val VIEWER_ARG_URI = "encodedUri"
     const val VIEWER_PATTERN = "viewer/{$VIEWER_ARG_URI}"
 
@@ -52,7 +55,20 @@ fun TriReadNavGraph(
                 viewModel = dashboardViewModel,
                 onOpenDocument = { uriString ->
                     navController.navigate(TriReadRoutes.viewerRoute(uriString))
+                },
+                onCheckForUpdates = {
+                    navController.navigate(TriReadRoutes.UPDATE)
                 }
+            )
+        }
+
+        composable(TriReadRoutes.UPDATE) {
+            val updateViewModel: UpdateViewModel = viewModel(
+                factory = UpdateViewModel.provideFactory(container.appUpdateManager)
+            )
+            UpdateScreen(
+                viewModel = updateViewModel,
+                onNavigateBack = { navController.popBackStack() }
             )
         }
 

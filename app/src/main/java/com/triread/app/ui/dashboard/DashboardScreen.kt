@@ -27,6 +27,7 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.SystemUpdate
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -69,7 +70,8 @@ import com.triread.app.util.StoragePermissionHelper
 @Composable
 fun DashboardScreen(
     viewModel: DashboardViewModel,
-    onOpenDocument: (String) -> Unit
+    onOpenDocument: (String) -> Unit,
+    onCheckForUpdates: () -> Unit = {}
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
@@ -135,6 +137,12 @@ fun DashboardScreen(
                     )
                 },
                 actions = {
+                    IconButton(onClick = onCheckForUpdates) {
+                        Icon(
+                            imageVector = Icons.Rounded.SystemUpdate,
+                            contentDescription = "Check for updates"
+                        )
+                    }
                     if (uiState.isSyncing) {
                         CircularProgressIndicator(
                             modifier = Modifier

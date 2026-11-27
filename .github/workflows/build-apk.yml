@@ -58,13 +58,26 @@ jobs:
           path: app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
+      - name: Generate release notes
+        id: notes
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          {
+            echo "body<<EOF"
+            echo "Build #${{ github.run_number }} (v1.0.${{ github.run_number }})"
+            echo ""
+            echo "What's New / Fixes:"
+            echo "- ${COMMIT_MSG}"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
       - name: Publish direct APK to GitHub Releases
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: TriRead Latest Build
-          body: Direct installable APK build of TriRead (pure Kotlin, 100% offline PDF/DOCX/PPTX reader).
+          name: "TriRead v1.0.${{ github.run_number }}"
+          body: ${{ steps.notes.outputs.body }}
           make_latest: true
           files: |
             app/build/outputs/apk/debug/TriRead.apk
