@@ -81,6 +81,11 @@ data class ParsedPresentation(
 ) {
     val aspectRatio: Float
         get() = (slideWidthPt / slideHeightPt.coerceAtLeast(1f)).coerceIn(0.6f, 2.5f)
+
+    companion object {
+        const val DEFAULT_SLIDE_WIDTH_PT = 960f
+        const val DEFAULT_SLIDE_HEIGHT_PT = 540f
+    }
 }
 
 class PptxParser(
@@ -782,8 +787,6 @@ class PptxParser(
         private const val EMU_PER_POINT = 12700f
         private const val DEFAULT_SLIDE_WIDTH_EMU = 12192000L // 16:9 widescreen (960pt)
         private const val DEFAULT_SLIDE_HEIGHT_EMU = 6858000L // 16:9 widescreen (540pt)
-        private const val DEFAULT_SLIDE_WIDTH_PT = 960f
-        private const val DEFAULT_SLIDE_HEIGHT_PT = 540f
 
         private val SLIDE_XML_REGEX = Regex("^ppt/slides/slide(\\d+)\\.xml$", RegexOption.IGNORE_CASE)
         private val SLIDE_RELS_REGEX = Regex("^ppt/slides/_rels/slide(\\d+)\\.xml\\.rels$", RegexOption.IGNORE_CASE)
