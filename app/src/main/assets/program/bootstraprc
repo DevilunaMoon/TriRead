@@ -1,0 +1,4 @@
+[Bootstrap]
+InstallMode=<installmode>
+ProductKey=Collabora Office 26.04
+UserInstallation=file://$APP_DATA_DIR

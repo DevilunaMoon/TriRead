@@ -1,0 +1,395 @@
+/* -*- js-indent-level: 8 -*- */
+/*
+ * Copyright the Collabora Online contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+function _createDropdownId(id) {
+    return id + '-dropdown';
+}
+function _createHeader(id, text) {
+    const characters = Array.from(text);
+    let endStart = characters.length - 12;
+    for (let i = endStart; i > endStart - 8 && i > 0; i--) {
+        if (characters[i - 1] === ' ') {
+            endStart = i;
+            break;
+        }
+    }
+    if (characters.length <= 16)
+        return {
+            id: id,
+            type: 'fixedtext',
+            text: text,
+            tooltip: text,
+        };
+    // The two parts are laid out side by side, which drops a plain space at the end of the first
+    // one, so a space at that end is made non-breaking and stays between the two parts.
+    const start = characters.slice(0, endStart).join('').replace(/ $/, '\u00a0');
+    return {
+        id: id,
+        type: 'container',
+        tooltip: text,
+        children: [
+            {
+                id: id + '-start',
+                type: 'fixedtext',
+                text: start,
+            },
+            {
+                id: id + '-end',
+                type: 'fixedtext',
+                text: characters.slice(endStart).join(''),
+            },
+        ],
+    };
+}
+// A restricted user does not see an entry whose command is blocked, and a locked user sees it
+// locked.
+function _isRestrictedEntry(entry) {
+    const map = window.L.Map.THIS;
+    return !!entry.uno && map.isRestrictedUser() && map.isRestrictedItem(entry);
+}
+function _isLockedEntry(entry) {
+    const map = window.L.Map.THIS;
+    return !!entry.uno && map.isLockedUser() && map.isLockedItem(entry);
+}
+JSDialog.CreateDropdownEntriesId = function (id) {
+    return id + '-entries';
+};
+JSDialog.OpenDropdown = function (id, popupParent, entries, innerCallback, popupAnchor, isSubmenu, earlyCallbackCall, noDefaultSelection) {
+    const json = {
+        id: _createDropdownId(id),
+        type: 'dropdown',
+        isSubmenu: isSubmenu,
+        jsontype: 'dialog',
+        popupParent: popupParent,
+        popupAnchor: popupAnchor,
+        gridKeyboardNavigation: false,
+        cancellable: true,
+        children: [
+            {
+                id: JSDialog.CreateDropdownEntriesId(id),
+                type: 'grid',
+                allyRole: 'listbox',
+                cols: 1,
+                rows: entries.length,
+                children: [],
+            },
+        ],
+    };
+    if (popupParent &&
+        typeof popupParent !== 'string' &&
+        typeof popupParent._onDropDown === 'function') {
+        popupParent._onDropDown(true);
+    }
+    const isChecked = function (unoCommand) {
+        const items = window.L.Map.THIS['stateChangeHandler'];
+        const val = items.getItemValue(unoCommand);
+        if (val && (val === true || val === 'true'))
+            return true;
+        else
+            return false;
+    };
+    for (let i = 0; i < entries.length; i++) {
+        if (entries[i].statusCommand) {
+            const items = window.L.Map.THIS['stateChangeHandler'];
+            const val = items.getItemValue(entries[i].statusCommand);
+            const uno = entries[i].uno;
+            const boolMatch = uno ? uno.match(/[?&]\w+:bool=(true|false)/) : null;
+            if (val !== undefined && boolMatch) {
+                const target = boolMatch[1] === 'true';
+                const expectedState = target ? 'isLandscape' : 'isPortrait';
+                entries[i].checked =
+                    String(val).toLowerCase() === expectedState.toLowerCase();
+            }
+            else if (val) {
+                const index = parseInt(val);
+                if (index === i) {
+                    entries[i].selected = true;
+                }
+                else {
+                    entries[i].selected = false;
+                }
+            }
+        }
+    }
+    const header = entries.find((entry) => entry.type === 'header');
+    const firstEntryIndex = entries[0]?.type === 'header' ? 1 : 0;
+    const shouldSelectFirstEntry = !noDefaultSelection && entries.length > 0
+        ? !entries.some((entry) => entry.selected === true)
+        : false;
+    let initialSelectedId;
+    let checkedFocusId;
+    for (let i = 0; i < entries.length; i++) {
+        const checkedValue = entries[i].checked === undefined
+            ? undefined
+            : (entries[i].uno ? isChecked('.uno' + entries[i].uno) : false) ||
+                (entries[i].action ? isChecked(String(entries[i].action)) : false);
+        let entry = null;
+        switch (entries[i].type) {
+            // DEPRECACTED: legacy plain HTML adapter
+            case 'html':
+                entry = {
+                    id: id + '-entry-' + i,
+                    type: 'htmlcontent',
+                    htmlId: entries[i].htmlId,
+                    closeCallback: function () {
+                        JSDialog.CloseDropdown(id);
+                    },
+                };
+                json.gridKeyboardNavigation = true;
+                break;
+            // dropdown is a colorpicker
+            case 'colorpicker':
+                entry = entries[i];
+                // for color picker we have a "KeyboardGridNavigation" function defined separately to handle custom cases
+                json.gridKeyboardNavigation = true;
+                break;
+            // allows to put regular JSDialog JSON into popup
+            case 'json':
+                entry =
+                    typeof entries[i].content !== 'undefined'
+                        ? entries[i].content
+                        : null;
+                initialSelectedId = entry
+                    ? entry.initialSelectedId
+                    : undefined;
+                // A grid, or a widget that wraps a grid (the new slide layout
+                // picker wraps one so it can also show the Overview button),
+                // navigates with grid keys. Otherwise list navigation lets
+                // arrow + Tab + arrow select more than one cell in a
+                // single-choice grid.
+                if (entry?.type === 'grid' ||
+                    entry?.gridContent?.type === 'grid')
+                    json.gridKeyboardNavigation = true;
+                break;
+            // shown as text above the entries, outside the list
+            case 'header':
+                break;
+            // horizontal separator in menu
+            case 'separator':
+                entry = {
+                    id: id + '-entry-' + i,
+                    type: 'separator',
+                    orientation: 'horizontal',
+                };
+                break;
+            // menu and submenu entry
+            case 'action':
+            case 'menu':
+            default: {
+                if (_isRestrictedEntry(entries[i]))
+                    break;
+                const isEnabled = entries[i].isEnabled;
+                const locked = _isLockedEntry(entries[i]);
+                entry = {
+                    id: id + '-entry-' + i,
+                    type: 'comboboxentry',
+                    customRenderer: entries[i].customRenderer,
+                    comboboxId: id,
+                    pos: i,
+                    text: entries[i].text,
+                    hint: entries[i].hint,
+                    shortcut: entries[i].shortcut,
+                    w2icon: entries[i].icon,
+                    icon: entries[i].img,
+                    checked: entries[i].checked || checkedValue,
+                    enabled: isEnabled ? isEnabled() : entries[i].enabled,
+                    selected: i === firstEntryIndex && shouldSelectFirstEntry
+                        ? true
+                        : entries[i].selected,
+                    hasSubMenu: !!entries[i].items,
+                    class: locked
+                        ? [entries[i].class, 'locking-disabled'].filter(Boolean).join(' ')
+                        : entries[i].class,
+                };
+                if (entry.selected)
+                    initialSelectedId = entry.id;
+                if (entry.checked &&
+                    !entry.selected)
+                    checkedFocusId = entry.id;
+                break;
+            }
+        }
+        if (entries[i].hidden)
+            entry = null;
+        if (entry && json?.children?.length)
+            json.children[0].children?.push(entry);
+        if (entries[i].separatorAfter && json?.children?.length)
+            json.children[0].children?.push({
+                id: id + '-separator-' + i,
+                type: 'separator',
+                orientation: 'horizontal',
+            });
+    }
+    const focusId = initialSelectedId || checkedFocusId;
+    if (focusId && json?.children?.length) {
+        json.init_focus_id = focusId;
+        json.children[0].initialSelectedId = focusId;
+    }
+    if (header && json?.children?.length) {
+        const headerId = id + '-header';
+        const grid = json.children[0];
+        grid.aria = { label: header.aria?.label, describedBy: headerId };
+        json.children = [
+            {
+                id: id + '-content',
+                type: 'container',
+                vertical: true,
+                children: [_createHeader(headerId, header.text || ''), grid],
+            },
+        ];
+    }
+    const generateCallback = function (targetEntries) {
+        let lastSubMenuOpened = null;
+        const closeLastSubMenu = () => {
+            if (!lastSubMenuOpened)
+                return;
+            JSDialog.CloseDropdown(lastSubMenuOpened);
+            lastSubMenuOpened = null;
+        };
+        return function (objectType, eventType, object, data, builder) {
+            // The entry position comes as a number or a 'pos;...' string; other
+            // payloads belong to the widget inside the dropdown and carry no
+            // entry position.
+            let pos = -1;
+            if (typeof data === 'number')
+                pos = data;
+            else if (typeof data === 'string')
+                pos = parseInt(data.substr(0, data.indexOf(';')));
+            const entry = targetEntries && pos >= 0 ? targetEntries[pos] : null;
+            if (entry) {
+                entry.pos = pos;
+            }
+            const subMenuId = object.id + '-' + pos;
+            if (eventType === 'selected' || eventType === 'showsubmenu') {
+                if (entry && entry.items) {
+                    // The submenu for this entry is already open; keep it.
+                    if (lastSubMenuOpened === subMenuId)
+                        return;
+                    closeLastSubMenu();
+                    // open submenu
+                    // Use the entry's known ID to find the DOM element that will become
+                    // popupParent. Positional lookup via querySelectorAll('.ui-grid-cell')
+                    // is unreliable because the grid renderer inserts an empty placeholder
+                    // cell at position 0, shifting every real entry by one slot.
+                    const dropdown = JSDialog.GetDropdown(object.id);
+                    const entryId = object.id + '-entry-' + pos;
+                    const targetEntry = dropdown
+                        ? dropdown.querySelector('[id="' + entryId + '"]')
+                        : null;
+                    JSDialog.OpenDropdown(subMenuId, targetEntry, entry.items, generateCallback(entry.items), 'top-end', true, earlyCallbackCall, noDefaultSelection);
+                    lastSubMenuOpened = subMenuId;
+                    app.layoutingService.appendLayoutingTask(() => {
+                        const dropdown = JSDialog.GetDropdown(subMenuId);
+                        if (!dropdown) {
+                            console.debug('Dropdown: missing :' + subMenuId);
+                            return;
+                        }
+                        const container = dropdown.querySelector('.ui-grid');
+                        JSDialog.MakeFocusCycle(container);
+                        const focusables = JSDialog.GetFocusableElements(container);
+                        if (focusables && focusables.length)
+                            focusables[0].focus();
+                    });
+                    return;
+                }
+                else if (eventType === 'selected' && entry && _isLockedEntry(entry)) {
+                    JSDialog.CloseAllDropdowns();
+                    window.L.Map.THIS.openUnlockPopup(entry.uno);
+                    return;
+                }
+                else if (eventType === 'selected' && entry && entry.uno) {
+                    if (earlyCallbackCall && innerCallback) {
+                        innerCallback(objectType, eventType, object, data, entry);
+                    }
+                    else {
+                        const uno = entry.uno.indexOf('.uno:') === 0
+                            ? entry.uno
+                            : '.uno:' + entry.uno;
+                        window.L.Map.THIS.sendUnoCommand(uno);
+                    }
+                    JSDialog.CloseAllDropdowns();
+                    return;
+                }
+                else {
+                    app.console.debug('Dropdown: potential unhandled action: "' + eventType + '"');
+                }
+            }
+            else if (eventType === 'hidedropdown') {
+                closeLastSubMenu();
+                JSDialog.CloseDropdown(id);
+                return;
+            }
+            else if (eventType === 'hideothersubmenu') {
+                closeLastSubMenu();
+                return;
+            }
+            // for multi-level menus last parameter should be used to handle event (it contains selected entry)
+            // usually last param is builder see: JSDialogCallback
+            if (!earlyCallbackCall &&
+                innerCallback &&
+                innerCallback(objectType, eventType, object, data, entry || builder))
+                return;
+            if (eventType === 'selected')
+                JSDialog.CloseAllDropdowns();
+            // we want to send render request to the default callback -> no warn
+            if (eventType === 'render_entry')
+                return;
+            app.console.warn('Dropdown: unhandled action: "' +
+                eventType +
+                '" for entry: "' +
+                JSON.stringify(entry) +
+                '"');
+        };
+    };
+    if (!isSubmenu) {
+        window.L.Map.THIS.fire('closepopups'); // close popups if a dropdown menu is opened
+        window.L.Map.THIS.fire('dropdownopen', {
+            id: id,
+            popupParent: popupParent,
+        });
+    }
+    window.L.Map.THIS.fire('jsdialog', {
+        data: json,
+        callback: generateCallback(entries),
+    });
+};
+JSDialog.CloseDropdown = function (id, focusHandled) {
+    window.L.Map.THIS.fire('jsdialog', {
+        data: {
+            id: _createDropdownId(id),
+            jsontype: 'dialog',
+            action: 'close',
+            focusHandled: focusHandled === true,
+        },
+    });
+};
+// True from the moment the dropdown is opened until it is closed, by any path.
+JSDialog.IsDropdownOpen = function (id) {
+    const jsdialog = window.L.Map.THIS.jsdialog;
+    return !!jsdialog && !!jsdialog.dialogs[_createDropdownId(id)];
+};
+JSDialog.CloseAllDropdowns = function () {
+    window.L.Map.THIS.jsdialog.closeAllDropdowns();
+    if (window.L.Map.THIS.contextToolbar)
+        window.L.Map.THIS.contextToolbar.hideContextToolbar();
+};
+JSDialog.GetDropdown = function (id) {
+    // remember it can get some random numbers due to JSDialog.MakeIdUnique
+    // TODO: use some register for it
+    const selector = '[id^="' + id + '"].modalpopup';
+    let dropdown = document.body.querySelector(selector);
+    if (!dropdown) {
+        JSDialog.ForEachPopoutDocument((childDocument) => {
+            if (!dropdown)
+                dropdown = childDocument.body.querySelector(selector);
+        });
+    }
+    return dropdown;
+};

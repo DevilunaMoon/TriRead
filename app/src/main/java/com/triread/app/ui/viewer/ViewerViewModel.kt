@@ -1,18 +1,21 @@
 package com.triread.app.ui.viewer
 
+import android.app.Activity
 import android.content.Context
 import android.graphics.Bitmap
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
-import com.triread.app.data.parser.DocxParser
+import com.triread.app.data.lokit.LOKitDocumentSession
+import com.triread.app.data.lokit.LOKitEngine
+import com.triread.app.data.lokit.LOKitPasswordProtectedException
 import com.triread.app.data.parser.PdfDocumentSession
 import com.triread.app.data.parser.PdfPasswordProtectedException
-import com.triread.app.data.parser.PptxParser
 import com.triread.app.domain.model.DocumentCategory
 import com.triread.app.domain.model.DocumentItem
 import com.triread.app.domain.repository.DocumentRepository
 import com.triread.app.util.IoExtensions.safeRecycle
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
@@ -27,8 +30,7 @@ class ViewerViewModel(
     private val uriString: String,
     private val appContext: Context,
     private val repository: DocumentRepository,
-    private val docxParser: DocxParser,
-    private val pptxParser: PptxParser
+    private val loKitEngine: LOKitEngine
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(ViewerUiState())
@@ -37,18 +39,29 @@ class ViewerViewModel(
     private var pdfSession: PdfDocumentSession? = null
     private val pdfBitmapCache = LinkedHashMap<Int, Bitmap>()
     private var pdfRenderJob: Job? = null
-    private var lastRenderWidthPx: Int = DEFAULT_RENDER_WIDTH_PX
 
-    init {
-        loadDocument()
+    private var lokSession: LOKitDocumentSession? = null
+    private val lokBitmapCache = LinkedHashMap<Int, Bitmap>()
+    private var lokRenderJob: Job? = null
+
+    private var lastRenderWidthPx: Int = DEFAULT_RENDER_WIDTH_PX
+    private var hasStartedInitialLoad = false
+
+    fun loadDocumentIfNeeded(activity: Activity) {
+        if (hasStartedInitialLoad) return
+        hasStartedInitialLoad = true
+        loadDocument(activity)
     }
 
-    fun loadDocument() {
+    fun reloadDocument(activity: Activity) {
+        loadDocument(activity)
+    }
+
+    private fun loadDocument(activity: Activity) {
         viewModelScope.launch {
             _uiState.update { it.copy(contentState = ViewerContentState.Loading) }
 
-            val docResult = repository.getDocument(uriString)
-            val document = docResult.getOrNull()
+            val document = repository.getDocument(uriString).getOrNull()
             if (document == null) {
                 _uiState.update {
                     it.copy(
@@ -71,8 +84,8 @@ class ViewerViewModel(
 
             when (document.category) {
                 DocumentCategory.PDF -> openPdf(document)
-                DocumentCategory.DOC -> openDoc(document)
-                DocumentCategory.PPT -> openPpt(document)
+                DocumentCategory.DOC,
+                DocumentCategory.PPT -> openWithLOKit(activity, document)
             }
         }
     }
@@ -127,97 +140,85 @@ class ViewerViewModel(
         )
     }
 
-    private suspend fun openDoc(document: DocumentItem) {
-        docxParser.parse(document.uriString, document.title).fold(
+    private suspend fun openWithLOKit(activity: Activity, document: DocumentItem) {
+        closeLokSession()
+
+        LOKitDocumentSession.open(
+            activity = activity,
+            context = appContext,
+            engine = loKitEngine,
+            uriString = document.uriString,
+            fileName = document.title,
+            category = document.category
+        ).fold(
             onFailure = { error ->
-                val title = if (error is SecurityException) "Permission Revoked" else "Unable to Open Document"
+                val (title, message) = when (error) {
+                    is LOKitPasswordProtectedException ->
+                        "Password-Protected File" to "Encrypted documents are not supported yet."
+                    is SecurityException ->
+                        "Permission Revoked" to "Please re-open this file using the file picker to grant access."
+                    else ->
+                        "Unable to Open Document" to (error.localizedMessage ?: "The file may be corrupted or unsupported.")
+                }
                 _uiState.update {
-                    it.copy(
-                        contentState = ViewerContentState.Error(
-                            title = title,
-                            message = error.localizedMessage ?: "The document could not be parsed."
-                        )
-                    )
+                    it.copy(contentState = ViewerContentState.Error(title = title, message = message))
                 }
             },
-            onSuccess = { parsed ->
-                val totalLogicalPages = ((parsed.blocks.size + BLOCKS_PER_PAGE - 1) / BLOCKS_PER_PAGE)
-                    .coerceAtLeast(1)
-                val restoredPage = document.currentPage.coerceIn(0, totalLogicalPages - 1)
-                val initialBlock = (restoredPage * BLOCKS_PER_PAGE)
-                    .coerceIn(0, (parsed.blocks.size - 1).coerceAtLeast(0))
-
-                _uiState.update {
-                    it.copy(
-                        currentPage = restoredPage,
-                        totalPages = totalLogicalPages,
-                        contentState = ViewerContentState.DocReady(
-                            blocks = parsed.blocks,
-                            initialBlockIndex = initialBlock,
-                            pageMetrics = parsed.pageMetrics,
-                            header = parsed.header,
-                            footer = parsed.footer,
-                            noticeMessage = parsed.noticeMessage
-                        )
-                    )
-                }
-                persistProgressAsync(restoredPage, totalLogicalPages)
-            }
-        )
-    }
-
-    private suspend fun openPpt(document: DocumentItem) {
-        pptxParser.parse(document.uriString, document.title).fold(
-            onFailure = { error ->
-                val title = if (error is SecurityException) "Permission Revoked" else "Unable to Open Presentation"
-                _uiState.update {
-                    it.copy(
-                        contentState = ViewerContentState.Error(
-                            title = title,
-                            message = error.localizedMessage ?: "The presentation could not be parsed."
-                        )
-                    )
-                }
-            },
-            onSuccess = { parsed ->
-                if (parsed.isLegacyUnsupported) {
+            onSuccess = { session ->
+                lokSession = session
+                val total = session.pageCount
+                if (total <= 0) {
                     _uiState.update {
                         it.copy(
                             contentState = ViewerContentState.Error(
-                                title = "Legacy .ppt Format",
-                                message = parsed.noticeMessage
-                                    ?: "Please convert this file to .pptx or .pdf to view it offline."
+                                title = "Empty Document",
+                                message = "This file contains no renderable pages."
                             )
                         )
                     }
                     return
                 }
 
-                val slideCount = parsed.slides.size
-                val restoredSlide = document.currentPage.coerceIn(0, (slideCount - 1).coerceAtLeast(0))
-                _uiState.update {
-                    it.copy(
-                        currentPage = restoredSlide,
-                        totalPages = slideCount,
-                        contentState = ViewerContentState.PptReady(
-                            slides = parsed.slides,
-                            initialSlide = restoredSlide,
-                            slideAspectRatio = parsed.aspectRatio,
-                            slideWidthPt = parsed.slideWidthPt,
-                            noticeMessage = parsed.noticeMessage
-                        )
+                val restoredPage = document.currentPage.coerceIn(0, total - 1)
+                val aspectMap = (0 until total).associateWith { idx -> session.pageAspectRatio(idx) }
+
+                val readyState = if (document.category == DocumentCategory.PPT) {
+                    ViewerContentState.PptReady(
+                        totalSlides = total,
+                        initialSlide = restoredPage,
+                        renderedSlides = emptyMap(),
+                        slideAspectRatios = aspectMap
+                    )
+                } else {
+                    ViewerContentState.DocReady(
+                        totalPages = total,
+                        initialPage = restoredPage,
+                        renderedPages = emptyMap(),
+                        pageAspectRatios = aspectMap
                     )
                 }
-                persistProgressAsync(restoredSlide, slideCount)
+
+                _uiState.update {
+                    it.copy(
+                        currentPage = restoredPage,
+                        totalPages = total,
+                        contentState = readyState
+                    )
+                }
+                persistProgressAsync(restoredPage, total)
+                updateLokWindow(restoredPage, lastRenderWidthPx)
             }
         )
     }
 
-    fun onPdfViewportWidthChanged(widthPx: Int) {
+    fun onViewportWidthChanged(widthPx: Int) {
         if (widthPx > 0 && kotlin.math.abs(widthPx - lastRenderWidthPx) > 120) {
             lastRenderWidthPx = widthPx
-            if (_uiState.value.contentState is ViewerContentState.PdfReady) {
-                updatePdfWindow(_uiState.value.currentPage, widthPx)
+            when (_uiState.value.contentState) {
+                is ViewerContentState.PdfReady -> updatePdfWindow(_uiState.value.currentPage, widthPx)
+                is ViewerContentState.DocReady,
+                is ViewerContentState.PptReady -> updateLokWindow(_uiState.value.currentPage, widthPx)
+                else -> Unit
             }
         }
     }
@@ -233,29 +234,11 @@ class ViewerViewModel(
         _uiState.update { it.copy(currentPage = clamped) }
         persistProgressAsync(clamped, total)
 
-        if (state.contentState is ViewerContentState.PdfReady) {
-            updatePdfWindow(clamped, lastRenderWidthPx)
-        }
-    }
-
-    fun onDocVisibleBlockChanged(firstVisibleBlockIndex: Int) {
-        val state = _uiState.value
-        if (state.contentState !is ViewerContentState.DocReady) return
-        val logicalPage = (firstVisibleBlockIndex / BLOCKS_PER_PAGE)
-            .coerceIn(0, (state.totalPages - 1).coerceAtLeast(0))
-        if (logicalPage != state.currentPage) {
-            _uiState.update { it.copy(currentPage = logicalPage) }
-            persistProgressAsync(logicalPage, state.totalPages)
-        }
-    }
-
-    fun onDocPrintPageChanged(pageIndex: Int, totalPrintPages: Int) {
-        val total = totalPrintPages.coerceAtLeast(1)
-        val clamped = pageIndex.coerceIn(0, total - 1)
-        val state = _uiState.value
-        if (clamped != state.currentPage || total != state.totalPages) {
-            _uiState.update { it.copy(currentPage = clamped, totalPages = total) }
-            persistProgressAsync(clamped, total)
+        when (state.contentState) {
+            is ViewerContentState.PdfReady -> updatePdfWindow(clamped, lastRenderWidthPx)
+            is ViewerContentState.DocReady,
+            is ViewerContentState.PptReady -> updateLokWindow(clamped, lastRenderWidthPx)
+            else -> Unit
         }
     }
 
@@ -292,8 +275,7 @@ class ViewerViewModel(
             val entering = !(state.isImmersive && state.pdfReadingMode == PdfReadingMode.HORIZONTAL_PAGED)
             state.copy(
                 pdfReadingMode = if (entering) PdfReadingMode.HORIZONTAL_PAGED else PdfReadingMode.VERTICAL_SCROLL,
-                isImmersive = entering,
-                showSettingsSheet = false
+                isImmersive = entering
             )
         }
         if (_uiState.value.contentState is ViewerContentState.PdfReady) {
@@ -310,68 +292,13 @@ class ViewerViewModel(
             val entering = !state.isLandscape
             state.copy(
                 isLandscape = entering,
-                isImmersive = entering,
-                showSettingsSheet = false
+                isImmersive = entering
             )
         }
     }
 
     fun toggleImmersiveMode() {
-        _uiState.update {
-            val nextImmersive = !it.isImmersive
-            it.copy(
-                isImmersive = nextImmersive,
-                showSettingsSheet = if (nextImmersive) false else it.showSettingsSheet
-            )
-        }
-    }
-
-    fun togglePrintLayout(enabled: Boolean) {
-        _uiState.update { state ->
-            state.copy(
-                typographySettings = state.typographySettings.copy(isPrintLayout = enabled)
-            )
-        }
-    }
-
-    fun toggleSettingsSheet() {
-        _uiState.update { it.copy(showSettingsSheet = !it.showSettingsSheet) }
-    }
-
-    fun dismissSettingsSheet() {
-        _uiState.update { it.copy(showSettingsSheet = false) }
-    }
-
-    fun toggleSpeakerNotes() {
-        _uiState.update { it.copy(showSpeakerNotes = !it.showSpeakerNotes) }
-    }
-
-    fun updateFontSize(sizeSp: Float) {
-        _uiState.update {
-            it.copy(
-                typographySettings = it.typographySettings.copy(
-                    fontSizeSp = sizeSp.coerceIn(13f, 26f)
-                )
-            )
-        }
-    }
-
-    fun updateLineSpacing(multiplier: Float) {
-        _uiState.update {
-            it.copy(
-                typographySettings = it.typographySettings.copy(
-                    lineHeightMultiplier = multiplier.coerceIn(1.2f, 2.0f)
-                )
-            )
-        }
-    }
-
-    fun selectReaderTheme(theme: ReaderTheme) {
-        _uiState.update {
-            it.copy(
-                typographySettings = it.typographySettings.copy(theme = theme)
-            )
-        }
+        _uiState.update { it.copy(isImmersive = !it.isImmersive) }
     }
 
     private fun updatePdfWindow(centerPage: Int, renderWidthPx: Int) {
@@ -423,6 +350,51 @@ class ViewerViewModel(
         }
     }
 
+    private fun updateLokWindow(centerPage: Int, renderWidthPx: Int) {
+        val session = lokSession ?: return
+        val total = session.pageCount
+        if (total <= 0) return
+
+        // Strict visible page +/- 1 buffer to keep LOKit memory lean
+        val radius = 1
+
+        lokRenderJob?.cancel()
+        lokRenderJob = viewModelScope.launch {
+            val window = ((centerPage - radius).coerceAtLeast(0)..(centerPage + radius).coerceAtMost(total - 1))
+                .toSet()
+
+            val renderOrder = listOf(centerPage, centerPage + 1, centerPage - 1)
+                .filter { it in window }
+
+            val evicted = mutableListOf<Bitmap>()
+            val iterator = lokBitmapCache.entries.iterator()
+            while (iterator.hasNext()) {
+                val entry = iterator.next()
+                if (entry.key !in window) {
+                    evicted.add(entry.value)
+                    iterator.remove()
+                }
+            }
+            if (evicted.isNotEmpty()) {
+                publishLokCache()
+                delay(60L)
+                evicted.forEach { it.safeRecycle() }
+            }
+
+            for (pageIndex in renderOrder) {
+                if (lokBitmapCache.containsKey(pageIndex)) continue
+                session.renderPage(pageIndex, renderWidthPx).onSuccess { bitmap ->
+                    if (pageIndex in window) {
+                        lokBitmapCache[pageIndex] = bitmap
+                        publishLokCache()
+                    } else {
+                        bitmap.safeRecycle()
+                    }
+                }
+            }
+        }
+    }
+
     private fun publishPdfCache() {
         val snapshot = pdfBitmapCache.toMap()
         _uiState.update { state ->
@@ -431,6 +403,19 @@ class ViewerViewModel(
                 state.copy(contentState = current.copy(renderedPages = snapshot))
             } else {
                 state
+            }
+        }
+    }
+
+    private fun publishLokCache() {
+        val snapshot = lokBitmapCache.toMap()
+        _uiState.update { state ->
+            when (val current = state.contentState) {
+                is ViewerContentState.DocReady ->
+                    state.copy(contentState = current.copy(renderedPages = snapshot))
+                is ViewerContentState.PptReady ->
+                    state.copy(contentState = current.copy(renderedSlides = snapshot))
+                else -> state
             }
         }
     }
@@ -453,21 +438,33 @@ class ViewerViewModel(
         pdfSession = null
     }
 
+    private fun closeLokSession() {
+        lokRenderJob?.cancel()
+        lokBitmapCache.values.forEach { it.safeRecycle() }
+        lokBitmapCache.clear()
+        val sessionToClose = lokSession
+        lokSession = null
+        if (sessionToClose != null) {
+            CoroutineScope(loKitEngine.lokDispatcher).launch {
+                sessionToClose.close()
+            }
+        }
+    }
+
     override fun onCleared() {
         super.onCleared()
         closePdfSession()
+        closeLokSession()
     }
 
     companion object {
         private const val DEFAULT_RENDER_WIDTH_PX = 1080
-        private const val BLOCKS_PER_PAGE = 8
 
         fun provideFactory(
             uriString: String,
             appContext: Context,
             repository: DocumentRepository,
-            docxParser: DocxParser,
-            pptxParser: PptxParser
+            loKitEngine: LOKitEngine
         ): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T {
@@ -478,8 +475,7 @@ class ViewerViewModel(
                     uriString = uriString,
                     appContext = appContext.applicationContext,
                     repository = repository,
-                    docxParser = docxParser,
-                    pptxParser = pptxParser
+                    loKitEngine = loKitEngine
                 ) as T
             }
         }

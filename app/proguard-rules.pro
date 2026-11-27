@@ -19,3 +19,7 @@
 # Coil
 -dontwarn okio.**
 
+# LibreOfficeKit JNI wrappers & callbacks
+-keep class org.libreoffice.kit.** { *; }
+-keepclassmembers class org.libreoffice.kit.** { *; }
+

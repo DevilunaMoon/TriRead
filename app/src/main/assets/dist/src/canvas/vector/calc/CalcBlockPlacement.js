@@ -1,0 +1,381 @@
+/* -*- js-indent-level: 8; fill-column: 100 -*- */
+/*
+ * Copyright the Collabora Online contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+/*
+ * Places block content at the zoom of the view. The engine names each position by the cell it
+ * falls in and the print twips into that cell, which depend neither on the zoom nor on the size of
+ * other columns and rows. The client rounds each column and row to whole pixels, in tile twips. A
+ * position maps to its cell: the cell edges go to the rounded edges, and a position inside keeps
+ * its share of the width. So fills, borders and clips end on the grid lines, and a zoom change or
+ * a column or a row that changes size only places the content again. Text keeps its glyph
+ * advances, and only its origin is mapped.
+ */
+var cool;
+(function (cool) {
+    const identity = { a: 1, d: 1, e: 0, f: 0 };
+    /// The types whose matrix places glyphs, of which only the origin is mapped.
+    const textTypes = new Set(['textSimplePortion', 'textDecoratedPortion']);
+    /// The types whose matrix maps the unit square onto an image.
+    const imageTypes = new Set([
+        'bitmap',
+        'bitmapAlpha',
+        'graphic',
+        'fillGraphic',
+    ]);
+    /// The types that stroke a path with a line of a width.
+    const strokeTypes = new Set(['polygonStroke', 'polyPolygonStroke']);
+    /// The names of the fields of a text that hold its lines, apart from its children.
+    const decorationFields = ['decorations', 'decorationsInTextColor'];
+    /// The names of the fields that hold a rectangle.
+    const rangeFields = [
+        'bounds',
+        'outputRange',
+        'definitionRange',
+        'referenceRange',
+        'graphicRange',
+        'clip',
+    ];
+    /// The commands and the coordinates of a path: "column:offset,row:offset" points.
+    const cellPathTokens = /[MLCZ]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?:[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/g;
+    /// The names of the fields that the placer moves. A field of the engine's primitives that
+    /// holds a position and is not one of these stays where it was.
+    cool.calcPlacedFields = new Set([
+        'matrix',
+        'path',
+        'startX',
+        'startY',
+        'endX',
+        'endY',
+        'areas',
+        'children',
+        'highlight',
+        ...rangeFields,
+        ...decorationFields,
+    ]);
+    function rounded(value) {
+        return Math.round(value * 100) / 100;
+    }
+    class Placer {
+        constructor(frame) {
+            this.frame = frame;
+        }
+        /// A position is of the content, before the axes, and is given back in the space of the
+        /// axes.
+        x(axes, position) {
+            const frame = this.frame;
+            const placed = frame.mapColumn(position[0], position[1]) - frame.tileOrigin.x;
+            return (placed - axes.e) / axes.a;
+        }
+        y(axes, position) {
+            const frame = this.frame;
+            const placed = frame.mapRow(position[0], position[1]) - frame.tileOrigin.y;
+            return (placed - axes.f) / axes.d;
+        }
+        range(axes, range) {
+            const x = this.x(axes, range.x);
+            const y = this.y(axes, range.y);
+            return {
+                x,
+                y,
+                width: this.x(axes, range.right) - x,
+                height: this.y(axes, range.bottom) - y,
+            };
+        }
+        /// The painted area of a part. Each column and row is rounded down to whole pixels, so it
+        /// is at most as large as in print twips, while text keeps the advances of its glyphs in
+        /// print twips. A text that reaches over several columns or lines then ends past its
+        /// placed ink, so the ink keeps at least its size in print twips.
+        ink(range) {
+            const placed = this.range(identity, range);
+            return {
+                x: placed.x,
+                y: placed.y,
+                width: Math.max(placed.width, this.printX(range.right) - this.printX(range.x)),
+                height: Math.max(placed.height, this.printY(range.bottom) - this.printY(range.y)),
+            };
+        }
+        /// A position of the block content in print twips on the sheet.
+        printX(position) {
+            return this.frame.printColumn(position[0]) + position[1];
+        }
+        printY(position) {
+            return this.frame.printRow(position[0]) + position[1];
+        }
+        /// The path data, which is absolute and has only M, L, C and Z, with every point and
+        /// control point mapped and written as SVG path data.
+        path(axes, data) {
+            let out = '';
+            let vertical = false;
+            let pointsInCommand = 0;
+            for (const token of data.match(cellPathTokens) ?? []) {
+                if (/^[MLCZ]$/.test(token)) {
+                    out += token;
+                    pointsInCommand = 0;
+                    continue;
+                }
+                const colon = token.indexOf(':');
+                const position = [
+                    parseFloat(token.substring(0, colon)),
+                    parseFloat(token.substring(colon + 1)),
+                ];
+                if (vertical) {
+                    out += ' ' + String(rounded(this.y(axes, position)));
+                    pointsInCommand++;
+                }
+                else {
+                    if (pointsInCommand)
+                        out += ' ';
+                    out += String(rounded(this.x(axes, position)));
+                }
+                vertical = !vertical;
+            }
+            return out;
+        }
+        primitives(primitives, axes, borders) {
+            return primitives?.map((primitive) => this.primitive(primitive, axes, borders));
+        }
+        primitive(primitive, axes, borders) {
+            const type = primitive.type ?? '';
+            const source = primitive;
+            const placed = { ...source };
+            const matrix = source.matrix;
+            const hasMatrix = Array.isArray(matrix) && matrix.length === 6;
+            if (type === cool.TransformPrimitive.type && hasMatrix) {
+                const [a, b, c, d, e, f] = matrix;
+                if (b === 0 && c === 0 && a !== 0 && d !== 0) {
+                    // The transform keeps its matrix, and its children are positions of the
+                    // content mapped through it.
+                    const inner = {
+                        a: axes.a * a,
+                        d: axes.d * d,
+                        e: axes.a * e + axes.e,
+                        f: axes.d * f + axes.f,
+                    };
+                    placed.children = this.primitives(primitive.children, inner, borders);
+                }
+                else {
+                    // A rotated or sheared content moves with its origin and keeps its shape.
+                    const origin = matrix;
+                    placed.matrix = [
+                        a,
+                        b,
+                        c,
+                        d,
+                        this.x(axes, origin[4]),
+                        this.y(axes, origin[5]),
+                    ];
+                }
+                return placed;
+            }
+            if (hasMatrix) {
+                // The origin is a position. An upright image has its far corner as a position
+                // too, in the places of the scale, so it stretches with its cells.
+                const positions = matrix;
+                const [a, b, c, d] = matrix;
+                const x = this.x(axes, positions[4]);
+                const y = this.y(axes, positions[5]);
+                if (imageTypes.has(type) && Array.isArray(positions[0]))
+                    placed.matrix = [
+                        this.x(axes, positions[0]) - x,
+                        0,
+                        0,
+                        this.y(axes, positions[3]) - y,
+                        x,
+                        y,
+                    ];
+                else if (textTypes.has(type) || imageTypes.has(type))
+                    placed.matrix = [a, b, c, d, x, y];
+            }
+            this.shapes(source, placed, axes);
+            // A border line is drawn whole pixels wide, at least one, as the tiles draw it.
+            const line = source.line;
+            if (borders && strokeTypes.has(type) && line && line.width) {
+                const pixel = this.frame.pixel;
+                const pixels = Math.max(1, Math.round((line.width * Math.abs(axes.a)) / pixel));
+                placed.line = { ...line, width: (pixels * pixel) / Math.abs(axes.a) };
+            }
+            if (primitive.children)
+                placed.children = this.primitives(primitive.children, axes, borders);
+            // The lines and the highlight of a text are in the space of its glyphs, apart from
+            // its children, and move with the text.
+            for (const field of decorationFields) {
+                const decorations = source[field];
+                if (Array.isArray(decorations))
+                    placed[field] = this.primitives(decorations, axes, false);
+            }
+            const highlight = source.highlight;
+            if (highlight && typeof highlight === 'object') {
+                const placedHighlight = { ...highlight };
+                this.shapes(highlight, placedHighlight, axes);
+                placed.highlight = placedHighlight;
+            }
+            return placed;
+        }
+        /// Move the paths, rectangles, line ends and areas of the source into placed.
+        shapes(source, placed, axes) {
+            if (typeof source.path === 'string')
+                placed.path = this.path(axes, source.path);
+            if (typeof source.clip === 'string')
+                placed.clip = this.path(axes, source.clip);
+            for (const field of rangeFields) {
+                const value = source[field];
+                if (Array.isArray(value) && value.length === 4) {
+                    placed[field] = [
+                        this.x(axes, value[0]),
+                        this.y(axes, value[1]),
+                        this.x(axes, value[2]),
+                        this.y(axes, value[3]),
+                    ];
+                }
+                else if (value && typeof value === 'object' && 'right' in value)
+                    placed[field] = this.range(axes, value);
+            }
+            if (source.startX !== undefined) {
+                placed.startX = this.x(axes, source.startX);
+                placed.startY = this.y(axes, source.startY);
+                placed.endX = this.x(axes, source.endX);
+                placed.endY = this.y(axes, source.endY);
+            }
+            if (Array.isArray(source.areas))
+                placed.areas = source.areas.map((area) => area.rect ? { ...area, rect: this.range(axes, area.rect) } : area);
+        }
+    }
+    function placeLayers(placer, layers) {
+        const placed = {};
+        for (const name of Object.keys(layers))
+            placed[name] = placer.primitives(layers[name], identity, name === 'borders');
+        return placed;
+    }
+    /// The layers of a block placed by the frame.
+    function calcPlacedLayers(layers, frame) {
+        return placeLayers(new Placer(frame), layers);
+    }
+    cool.calcPlacedLayers = calcPlacedLayers;
+    /// Maps a cell and the print twips into it to tile twips, with the start of the cell on its
+    /// whole pixel, where the grid lines are: fills of cells next to each other then meet on one
+    /// pixel and leave no seam, which they do where an edge falls between two pixels. The share
+    /// of the cell is kept, and a hidden cell draws nothing beyond its edge. pixel is the twips in
+    /// a pixel. A cell is looked up once.
+    function calcCellMap(dimension, pixel) {
+        const known = new Map();
+        return (cell, offset) => {
+            let mapping = known.get(cell);
+            if (mapping === undefined) {
+                const pixels = dimension.getElementDataAny(cell, 'corepixels');
+                const print = dimension.getElementDataAny(cell, 'printtwips');
+                mapping = {
+                    start: pixels ? pixels.startpos * pixel : NaN,
+                    scale: pixels && print && print.size > 0
+                        ? (pixels.size * pixel) / print.size
+                        : 0,
+                };
+                known.set(cell, mapping);
+            }
+            return mapping.start + Math.round(offset * mapping.scale);
+        };
+    }
+    cool.calcCellMap = calcCellMap;
+    /// The start of each column or row in print twips, looked up once.
+    function calcCellStart(dimension) {
+        const known = new Map();
+        return (cell) => {
+            let start = known.get(cell);
+            if (start === undefined) {
+                const data = dimension.getElementDataAny(cell, 'printtwips');
+                start = data ? data.startpos : NaN;
+                known.set(cell, start);
+            }
+            return start;
+        };
+    }
+    cool.calcCellStart = calcCellStart;
+    /// Maps the rows, or the columns, of content from before the shifts to where their cells are
+    /// now, the shifts taken in their order.
+    function calcIndexShift(shifts, axis) {
+        const applied = shifts.filter((shift) => shift.axis === axis);
+        return (index) => {
+            let removed = false;
+            for (const shift of applied) {
+                if (shift.by < 0 && index >= shift.at + shift.by && index < shift.at) {
+                    index = shift.at + shift.by;
+                    removed = true;
+                }
+                else if (index >= shift.at)
+                    index += shift.by;
+            }
+            return { index, removed };
+        };
+    }
+    cool.calcIndexShift = calcIndexShift;
+    /// The block with its parts placed at the sheet zoom and its joined layers left empty. The
+    /// shifts are those the block predates: its content is placed where its cells moved, and the
+    /// rows that were removed are left out.
+    function calcPlacedBlock(block, geometry, pixel, shifts = []) {
+        const columns = geometry.getColumnsGeometry();
+        const rows = geometry.getRowsGeometry();
+        const pixelColumn = columns.getElementDataAny(block.startColumn, 'corepixels');
+        const pixelRow = rows.getElementDataAny(block.startRow, 'corepixels');
+        if (!pixelColumn || !pixelRow)
+            return undefined;
+        // The origin lies on the pixel of the first cell, as every cell start does.
+        const tileOrigin = new cool.Point(pixelColumn.startpos * pixel, pixelRow.startpos * pixel);
+        const mapColumn = calcCellMap(columns, pixel);
+        const mapRow = calcCellMap(rows, pixel);
+        const printColumn = calcCellStart(columns);
+        const printRow = calcCellStart(rows);
+        const shiftColumn = calcIndexShift(shifts, 'columns');
+        const shiftRow = calcIndexShift(shifts, 'rows');
+        const frame = shifts.length
+            ? {
+                mapColumn: (cell, offset) => mapColumn(shiftColumn(cell).index, offset),
+                mapRow: (cell, offset) => mapRow(shiftRow(cell).index, offset),
+                printColumn: (cell) => printColumn(shiftColumn(cell).index),
+                printRow: (cell) => printRow(shiftRow(cell).index),
+                tileOrigin,
+                pixel,
+            }
+            : {
+                mapColumn,
+                mapRow,
+                printColumn,
+                printRow,
+                tileOrigin,
+                pixel,
+            };
+        const placer = new Placer(frame);
+        const placePart = (part) => ({
+            version: part.version,
+            content: {
+                ink: part.content.ink ? placer.ink(part.content.ink) : undefined,
+                layers: part.content.layers
+                    ? placeLayers(placer, part.content.layers)
+                    : undefined,
+            },
+        });
+        const rowsInOrder = Array.from(block.rows.keys())
+            .filter((row) => !shiftRow(row).removed)
+            .sort((a, b) => a - b);
+        const content = block.content;
+        return {
+            ...block,
+            borders: block.borders ? placePart(block.borders) : undefined,
+            rows: new Map(rowsInOrder.map((row) => [
+                row,
+                placePart(block.rows.get(row)),
+            ])),
+            content: {
+                bounds: placer.range(identity, content.bounds),
+                ink: content.ink ? placer.ink(content.ink) : undefined,
+                layers: {},
+            },
+        };
+    }
+    cool.calcPlacedBlock = calcPlacedBlock;
+})(cool || (cool = {}));

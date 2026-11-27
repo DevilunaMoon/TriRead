@@ -2,8 +2,7 @@ package com.triread.app
 
 import android.content.Context
 import com.triread.app.data.local.AppDatabase
-import com.triread.app.data.parser.DocxParser
-import com.triread.app.data.parser.PptxParser
+import com.triread.app.data.lokit.LOKitEngine
 import com.triread.app.data.repository.DocumentRepositoryImpl
 import com.triread.app.data.scanner.MediaStoreDocumentScanner
 import com.triread.app.data.scanner.ThumbnailGenerator
@@ -26,12 +25,8 @@ class AppContainer(context: Context) {
         ThumbnailGenerator(appContext)
     }
 
-    val docxParser: DocxParser by lazy {
-        DocxParser(appContext)
-    }
-
-    val pptxParser: PptxParser by lazy {
-        PptxParser(appContext)
+    val loKitEngine: LOKitEngine by lazy {
+        LOKitEngine(appContext)
     }
 
     val appUpdateManager: AppUpdateManager by lazy {

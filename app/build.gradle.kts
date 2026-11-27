@@ -21,6 +21,9 @@ android {
         vectorDrawables {
             useSupportLibrary = true
         }
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
     }
 
     signingConfigs {
@@ -69,7 +72,14 @@ android {
         buildConfig = true
     }
 
+    androidResources {
+        noCompress += listOf("rdb", "zip", "bin", "dat", "ttf", "otf", "xml", "ui", "xcu", "xcd", "properties")
+    }
+
     packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }

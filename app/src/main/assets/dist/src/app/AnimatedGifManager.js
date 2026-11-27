@@ -1,0 +1,112 @@
+/* -*- js-indent-level: 8 -*- */
+/*
+ * Copyright the Collabora Online contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+/*
+ * AnimatedGifManager plays animated images (for example animated GIFs) over the
+ * document while editing or viewing.
+ */
+class AnimatedGifManager {
+    constructor(map) {
+        this._sections = new Map();
+        this._presentationInfo = null;
+        this._map = map;
+        map.on('docloaded', this._onDocLoaded, this);
+        map.on('presentationinfo', this._onPresentationInfo, this);
+        map.on('updateparts', this._onUpdateParts, this);
+        map.on('zoomend', this._onZoomEnd, this);
+        app.events.on('contextchange', this._onContextChange.bind(this));
+    }
+    // Ask for the presentation info on load so animated images already in the
+    // file start playing without a prior edit.
+    _onDocLoaded() {
+        const docType = this._map.getDocType();
+        if ((docType === 'presentation' || docType === 'drawing') &&
+            app.socket.connected()) {
+            app.socket.sendMessage('getpresentationinfo');
+        }
+    }
+    _onPresentationInfo(info) {
+        this._presentationInfo = info;
+        this._reconcileCurrentPart();
+    }
+    _onUpdateParts() {
+        this._reconcileCurrentPart();
+    }
+    _onContextChange() {
+        this._reconcileCurrentPart();
+    }
+    // Picks the gifs of the part on screen out of the stored presentation info
+    // and brings the overlays in line with them.
+    _reconcileCurrentPart() {
+        if (!this._presentationInfo || !this._presentationInfo.slides)
+            return;
+        const docLayer = this._map._docLayer;
+        const part = docLayer ? docLayer._selectedPart : 0;
+        // The presentation info lists the slides of the normal view.
+        // The master and notes views show other pages under the same part numbers
+        const normalView = !app.activeDocument || app.activeDocument.isModeActive(0);
+        const slide = normalView ? this._presentationInfo.slides[part] : null;
+        const gifs = (slide && slide.gifs) || [];
+        this._reconcile(gifs);
+    }
+    // Brings the overlay sections in line with the given list: repositions the
+    // ones still present, adds the new ones, and removes the rest.
+    _reconcile(gifs) {
+        const wanted = new Set();
+        let changed = false;
+        for (const gif of gifs) {
+            wanted.add(gif.id);
+            const rectangle = [gif.x, gif.y, gif.width, gif.height];
+            const mirror = gif.mirror ?? 0;
+            const existing = this._sections.get(gif.id);
+            if (existing && existing.getUrl() === gif.url) {
+                if (existing.mirror !== mirror ||
+                    !this._sameRectangle(existing.sectionProperties.twipRectangle, rectangle)) {
+                    existing.mirror = mirror;
+                    existing.updateTwipRectangle(rectangle);
+                    changed = true;
+                }
+            }
+            else {
+                if (existing) {
+                    app.sectionContainer.removeSection(existing.name);
+                    this._sections.delete(gif.id);
+                }
+                const section = new AnimatedGifSection('AnimatedGif-' + String(gif.id), rectangle, gif.url);
+                section.mirror = mirror;
+                this._sections.set(gif.id, section);
+                app.sectionContainer.addSection(section);
+                changed = true;
+            }
+        }
+        for (const [id, section] of this._sections) {
+            if (!wanted.has(id)) {
+                app.sectionContainer.removeSection(section.name);
+                this._sections.delete(id);
+                changed = true;
+            }
+        }
+        if (changed)
+            app.sectionContainer.requestReDraw();
+    }
+    _sameRectangle(a, b) {
+        return a.length === b.length && a.every((value, i) => value === b[i]);
+    }
+    // The twip-to-pixel scale changes with zoom, so recompute every overlay's
+    // position and size from its stored rectangle.
+    _onZoomEnd() {
+        if (this._sections.size === 0)
+            return;
+        for (const section of this._sections.values()) {
+            section.updateTwipRectangle(section.sectionProperties.twipRectangle);
+        }
+        app.sectionContainer.requestReDraw();
+    }
+}

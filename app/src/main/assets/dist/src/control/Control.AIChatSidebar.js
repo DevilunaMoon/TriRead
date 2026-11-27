@@ -1,0 +1,3625 @@
+/* -*- js-indent-level: 8 -*- */
+/*
+ * Copyright the Collabora Online contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+var cool;
+(function (cool) {
+    class AIChatSidebar {
+        constructor() {
+            this.messages = [];
+            this.isProcessing = false;
+            this.currentRequestId = '';
+            this.inputText = '';
+            this._isActive = false;
+            this.lastSentSelectedText = '';
+            this.hintText = '';
+            this.progressText = '';
+            this.pendingFormulaContext = '';
+            // Buttons-to-attach for the in-flight request. Set when the
+            // backend forwards an aichatchoices: payload (big-document
+            // branch of extract_document_structure); consumed when the
+            // matching assistant reply lands.
+            this.pendingChoices = null;
+            // The formula diagnosis message waiting for the user to agree to send
+            // the cells it lists, and the card that lists them. Null when no
+            // diagnosis is waiting.
+            this.pendingDiagnosis = null;
+            this.selectedTone = null;
+            this.emojify = false;
+            this.tonePickerOpen = false;
+            // Design template the user picked for a generated deck, recorded when
+            // a deck decision card is approved with a pick. Null means no pick has
+            // been made in this conversation; the decision cards keep offering the
+            // catalog until one is.
+            this.designTemplate = null;
+            // True while an approval or outline card is on screen waiting for the
+            // user's decision. The request timeout does not fire while it is set,
+            // so the user can deliberate longer than one timeout window.
+            this.awaitingUserDecision = false;
+            // The design-template catalog, prefetched when the sidebar opens on a
+            // fresh deck so a decision card's picker does not race the fetch
+            // timeout. Null until the first fetch starts.
+            this.templateCatalogPromise = null;
+            this.customTones = [];
+            this.recentIcons = [];
+            this.formOpen = false;
+            this.formMode = 'add';
+            this.formDraft = null;
+            // The icon row rendered in the form. Stable for the lifetime of one
+            // form-open session so that clicks land on the same slot the user saw.
+            // Refreshed only when the form is (re-)opened or a new emoji is
+            // pulled in from the full picker.
+            this.formIconRow = [];
+            this.emojiPickerOpen = false;
+            this.deleteConfirmOpen = false;
+            this.PROMPT_CARDS = [
+                { prompt: _('Make it more concise'), icon: 'lc_aichat_shorten.svg' },
+                { prompt: _('Summarize this text'), icon: 'lc_aichat_summarize.svg' },
+                { prompt: _('Expand this text'), icon: 'lc_aichat_expand.svg' },
+                { prompt: _('Fix grammar & spelling'), icon: 'lc_aichat_fixgrammar.svg' },
+            ];
+            this.TONE_PRESETS = [
+                { id: 'natural', label: _('Natural'), icon: '✨' },
+                { id: 'formal', label: _('Formal'), icon: '💼' },
+                { id: 'short', label: _('Short'), icon: '✂️' },
+                { id: 'friendly', label: _('Friendly'), icon: '😊' },
+                { id: 'professional', label: _('Professional'), icon: '🎯' },
+                { id: 'casual', label: _('Casual'), icon: '💬' },
+            ];
+            this.INITIAL_CARDS_SHOWN = 4;
+            this.showAllCards = false;
+            this.SELECTION_FETCH_TIMEOUT_MS = 5000;
+            this.COPY_FEEDBACK_DURATION_MS = 1500;
+            this.TEXTAREA_MAX_HEIGHT_PX = 120;
+            this.FORMULA_FETCH_TIMEOUT_MS = 5000;
+            this.TEMPLATE_FETCH_TIMEOUT_MS = 5000;
+            this.MAX_API_MESSAGES = 50;
+            this.MAX_MESSAGE_LENGTH = 100000; // 100K characters
+            this.MAX_CUSTOM_TONES = 20;
+            this.MAX_TONE_NAME_LEN = 50;
+            this.MAX_TONE_DESC_LEN = 1000;
+            this.ICON_ROW_LEN = 8;
+            this.DEFAULT_TONE_ICONS = [
+                '😊',
+                '✨',
+                '💼',
+                '🎯',
+                '💬',
+                '📝',
+                '🔥',
+                '🧘',
+            ];
+            this.PREFS_CUSTOM_TONES = 'aichat.customTones';
+            this.PREFS_RECENT_ICONS = 'aichat.toneIconRecents';
+            this.PREFS_SELECTED_TONE = 'aichat.selectedTone';
+            this.PREFS_EMOJIFY = 'aichat.emojify';
+            this.isValidCustomTone = (t) => {
+                return (t &&
+                    typeof t.id === 'string' &&
+                    typeof t.name === 'string' &&
+                    typeof t.icon === 'string' &&
+                    typeof t.description === 'string');
+            };
+            this.ICON_TRASH = 'lc_aichat_trash.svg';
+            this.ICON_CLOSE = 'lc_aichat_close.svg';
+            this.ICON_SEND = 'lc_aichat_send.svg';
+            this.ICON_INSERT = 'lc_aichat_insert.svg';
+            this.ICON_STOP = 'lc_aichat_stop.svg';
+            this.ICON_SPARKLE = 'lc_aichat_sparkle.svg';
+            // Keep as data URI: transient success indicator with semantic green color
+            this.ICON_CHECK = "data:image/svg+xml,%3Csvg viewBox='0 0 24 24' xmlns='http://www.w3.org/2000/svg' " +
+                "fill='none' stroke='%2322c55e' stroke-width='2.5' stroke-linecap='round' " +
+                "stroke-linejoin='round'%3E%3Cpath d='M5 13l4 4L19 7'/%3E%3C/svg%3E";
+            this._keyboardHandlerAttached = false;
+            this.container = document.getElementById('aichat-panel');
+            this.wrapper = document.getElementById('aichat-dock-wrapper');
+            this.createBuilder();
+            this.setupCellRefNavigation();
+            this.registerChatHandlers();
+            this.loadPrefs();
+        }
+        loadPrefs() {
+            try {
+                const raw = window.prefs.get(this.PREFS_CUSTOM_TONES, '[]');
+                const parsed = JSON.parse(raw);
+                this.customTones = Array.isArray(parsed)
+                    ? parsed.filter(this.isValidCustomTone)
+                    : [];
+            }
+            catch {
+                this.customTones = [];
+            }
+            try {
+                const raw = window.prefs.get(this.PREFS_RECENT_ICONS, 'null');
+                const parsed = JSON.parse(raw);
+                this.recentIcons =
+                    Array.isArray(parsed) &&
+                        parsed.length === this.ICON_ROW_LEN &&
+                        parsed.every((s) => typeof s === 'string')
+                        ? parsed.slice()
+                        : this.DEFAULT_TONE_ICONS.slice();
+            }
+            catch {
+                this.recentIcons = this.DEFAULT_TONE_ICONS.slice();
+            }
+            const sel = window.prefs.get(this.PREFS_SELECTED_TONE, '');
+            this.selectedTone = sel || null;
+            this.emojify = window.prefs.getBoolean(this.PREFS_EMOJIFY, false);
+            if (this.selectedTone && !this.isKnownToneId(this.selectedTone)) {
+                this.selectedTone = null;
+                window.prefs.remove(this.PREFS_SELECTED_TONE);
+            }
+        }
+        isKnownToneId(id) {
+            return (this.TONE_PRESETS.some((p) => p.id === id) ||
+                this.customTones.some((t) => t.id === id));
+        }
+        saveCustomTones() {
+            window.prefs.set(this.PREFS_CUSTOM_TONES, JSON.stringify(this.customTones));
+        }
+        saveRecentIcons() {
+            window.prefs.set(this.PREFS_RECENT_ICONS, JSON.stringify(this.recentIcons));
+        }
+        saveSelectedTone() {
+            if (this.selectedTone) {
+                window.prefs.set(this.PREFS_SELECTED_TONE, this.selectedTone);
+            }
+            else {
+                window.prefs.remove(this.PREFS_SELECTED_TONE);
+            }
+        }
+        saveEmojify() {
+            window.prefs.set(this.PREFS_EMOJIFY, this.emojify ? 'true' : 'false');
+        }
+        generateToneId() {
+            const r = typeof crypto !== 'undefined' && crypto.randomUUID
+                ? crypto.randomUUID()
+                : Date.now().toString(36) +
+                    '-' +
+                    Math.random().toString(36).slice(2, 10);
+            return 'tone-' + r;
+        }
+        findCustomTone(id) {
+            return this.customTones.find((t) => t.id === id);
+        }
+        // Accessible name of a tone button.
+        toneAriaLabel(name) {
+            // TRANSLATORS: {0} is the name of a tone of voice, either a preset
+            // TRANSLATORS: such as "Formal" or a name that the user typed
+            return _('{0} tone').replace('{0}', name);
+        }
+        createBuilder() {
+            this.builder = new window.L.control.jsDialogBuilder({
+                mobileWizard: this,
+                map: app.map,
+                windowId: -1,
+                cssClass: 'jsdialog sidebar',
+                useScrollAnimation: false,
+                suffix: 'sidebar',
+                callback: this.jsdialogCallback.bind(this),
+            });
+        }
+        registerChatHandlers() {
+            app.map.on('aichatresult', this.onAIChatResult, this);
+            app.map.on('aichatprogress', this.onAIChatProgress, this);
+            app.map.on('aichatapproval', this.onAIChatApproval, this);
+            app.map.on('aichatchoices', this.onAIChatChoices, this);
+            app.map.on('aichatoutline', this.onAIChatOutline, this);
+            app.map.on('docloaded', this.onDocLoaded, this);
+            app.map.on('textselectionchange', this.onTextSelectionChange, this);
+        }
+        onDocLoaded(e) {
+            if (e.status === false && this._isActive) {
+                this.hide();
+                this.resetVoiceState();
+                this.clearConversation();
+            }
+        }
+        onTextSelectionChange() {
+            if (!this._isActive)
+                return;
+            const selCtx = document.getElementById('aichat-selection-context');
+            if (selCtx) {
+                selCtx.style.display = TextSelections.isActive() ? '' : 'none';
+            }
+        }
+        toggle() {
+            if (this._isActive) {
+                this.hide();
+            }
+            else {
+                this.show();
+            }
+        }
+        show() {
+            this._isActive = true;
+            this.render();
+            this.wrapper.classList.add('visible');
+            this.focusInput();
+            // Warm the design-template catalog while the user types, so the
+            // picker is ready by the time the first deck request goes out.
+            if (!this.templateCatalogPromise &&
+                app.map.getDocType() === 'presentation' &&
+                app.map.getNumberOfParts() <= 1) {
+                this.templateCatalogPromise = this.fetchDesignTemplates();
+            }
+        }
+        hide() {
+            this._isActive = false;
+            this.wrapper.classList.remove('visible');
+            if (!app.map.editorHasFocus()) {
+                app.map.fire('editorgotfocus');
+                app.map.focus();
+            }
+        }
+        isVisible() {
+            return this._isActive;
+        }
+        // Refresh just the model name and ethical-rating badge in place, without
+        // rebuilding the whole sidebar. Used after the AI provider is
+        // reconfigured while the sidebar is open, so an active chat is left
+        // untouched.
+        refreshModelAndRating() {
+            if (!this._isActive)
+                return;
+            this.builder.updateWidget(this.container, this.getEUNoticeJSON());
+            app.layoutingService.onDrain(() => {
+                this.applyRatingBadge();
+            });
+        }
+        render() {
+            if (!this._isActive)
+                return;
+            this.container.replaceChildren();
+            const data = this.getWidgetJSON();
+            this.builder.build(this.container, [data], false);
+            this.applyMessageStyles();
+            this.applyInputStyles();
+            this.applyRatingBadge();
+            this.setTonePickerOpenClass(this.tonePickerOpen);
+            this.scrollToBottom();
+            this.attachContainerKeyboardHandler();
+            if (!this.tonePickerOpen && !this.isProcessing) {
+                this.focusInput();
+            }
+        }
+        static ratingLabel(letter) {
+            switch (letter) {
+                case 'A':
+                    return _('Best');
+                case 'B':
+                    return _('Good');
+                case 'C':
+                    return _('Poor');
+                default:
+                    return _('Unknown');
+            }
+        }
+        applyRatingBadge() {
+            const badge = document.getElementById('aichat-rating-badge');
+            if (!badge)
+                return;
+            const letter = app.map.aiEthicalRating || 'U';
+            badge.setAttribute('data-rating', letter);
+            const wrapper = document.getElementById('aichat-eu-wrapper');
+            // ai.ethical_rating_message=false leaves the bare letter: no tooltip
+            // and nothing for a screen reader to read out. Mark the wrapper so it
+            // drops the help cursor that would otherwise promise a tooltip.
+            if (wrapper)
+                wrapper.classList.toggle('aichat-eu-no-rating-message', !window.aiEthicalRatingMessage);
+            if (!window.aiEthicalRatingMessage)
+                return;
+            const label = AIChatSidebar.ratingLabel(letter);
+            const aria = _('Ethical AI rating: {0} ({1}). Based on open-source licensing, self-hosting, and training data.')
+                .replace('{0}', letter)
+                .replace('{1}', label);
+            badge.setAttribute('role', 'img');
+            badge.setAttribute('aria-label', aria);
+            if (wrapper)
+                wrapper.setAttribute('title', aria);
+        }
+        updateMessagesArea() {
+            this.builder.updateWidget(this.container, this.getMessagesAreaJSON());
+            app.layoutingService.onDrain(() => {
+                this.applyMessageStyles();
+                this.scrollToBottom();
+            });
+        }
+        updateInputArea() {
+            this.builder.updateWidget(this.container, this.getInputJSON());
+            app.layoutingService.onDrain(() => {
+                this.applyInputStyles();
+                this.applyRatingBadge();
+                if (!this.isProcessing) {
+                    this.focusInput();
+                }
+            });
+        }
+        updateHint() {
+            this.builder.updateWidget(this.container, this.getHintJSON());
+        }
+        updateHeader() {
+            this.builder.updateWidget(this.container, this.getHeaderJSON());
+        }
+        updateChatState(includeHeader = false) {
+            this.updateMessagesArea();
+            this.updateInputArea();
+            this.updateHint();
+            if (includeHeader) {
+                this.updateHeader();
+            }
+        }
+        appendMessage(msg, index) {
+            // Full rebuilds of the messages area run as queued layouting
+            // tasks. Appending through the same queue keeps this message
+            // ordered after a rebuild that is still pending, even when the
+            // server answers within milliseconds.
+            app.layoutingService.appendLayoutingTask(() => {
+                const messagesList = document.getElementById('aichat-messages-list');
+                if (!messagesList) {
+                    this.updateMessagesArea();
+                    return;
+                }
+                this.builder.build(messagesList, [this.getMessageJSON(msg, index)], true);
+                this.applyStyleForMessage(index);
+                this.scrollToBottom();
+            });
+        }
+        updateLoadingDots() {
+            this.builder.updateWidget(this.container, this.getLoadingDotsJSON());
+            app.layoutingService.onDrain(() => {
+                this.scrollToBottom();
+            });
+        }
+        applyStyleForMessage(index) {
+            const msg = this.messages[index];
+            const el = document.getElementById('aichat-msg-' + index);
+            if (!el || !msg)
+                return;
+            const cls = msg.role === 'user' ? 'aichat-msg-user' : 'aichat-msg-assistant';
+            el.classList.add(cls);
+            if (msg.isError) {
+                el.classList.add('aichat-msg-error');
+            }
+            if (msg.isApproval) {
+                el.classList.add('aichat-msg-approval');
+                if (msg.approvalType === 'modify') {
+                    el.classList.add('aichat-msg-approval-modify');
+                }
+            }
+            const label = msg.role === 'user'
+                ? _('Your message')
+                : msg.isApproval
+                    ? _('Action requiring approval')
+                    : msg.isError
+                        ? _('Error message')
+                        : _('AI response');
+            el.setAttribute('aria-label', label);
+            this.attachMessageControls(msg, index, el);
+        }
+        // Appends the controls a message still awaiting a decision carries. They
+        // are built here rather than in the message JSON, so a rebuild of the
+        // messages area puts them back from the message's own state. A message
+        // whose decision has been sent carries none.
+        attachMessageControls(msg, index, el) {
+            if (msg.decided)
+                return;
+            if (msg.outline && !el.querySelector('.aichat-outline-card')) {
+                const card = this.buildOutlineCard(msg.outline, index);
+                el.appendChild(card);
+                // The textareas can only measure their content once they are in
+                // the document, so size each gist after the card is attached.
+                card
+                    .querySelectorAll('textarea.aichat-outline-gist')
+                    .forEach((ta) => this.growGist(ta));
+                return;
+            }
+            if (msg.isApproval && !el.querySelector('.aichat-approval-buttons')) {
+                el.appendChild(msg.isDiagnosisConfirmation
+                    ? this.buildDiagnosisButtons()
+                    : this.buildApprovalButtons());
+            }
+        }
+        applyMessageStyles() {
+            for (let i = 0; i < this.messages.length; i++) {
+                this.applyStyleForMessage(i);
+            }
+            this.applyCardStyles();
+        }
+        applyCardStyles() {
+            const chips = document.getElementById('aichat-chips');
+            if (!chips)
+                return;
+            chips.setAttribute('role', 'list');
+            const wrappers = chips.querySelectorAll('[id^="aichat-chip-"]');
+            wrappers.forEach((w) => w.setAttribute('role', 'listitem'));
+        }
+        applyInputStyles() {
+            const sendBtn = document.querySelector('#aichat-send-btn button.ui-pushbutton');
+            if (sendBtn) {
+                sendBtn.classList.toggle('aichat-stop-mode', this.isProcessing);
+            }
+            const selCtx = document.getElementById('aichat-selection-context');
+            if (selCtx) {
+                selCtx.style.display = TextSelections.isActive() ? '' : 'none';
+            }
+        }
+        scrollToBottom() {
+            requestAnimationFrame(() => {
+                const messagesArea = document.getElementById('aichat-messages-area');
+                if (messagesArea) {
+                    messagesArea.scrollTo({
+                        top: messagesArea.scrollHeight,
+                        behavior: 'smooth',
+                    });
+                }
+            });
+        }
+        focusInput() {
+            requestAnimationFrame(() => {
+                const textarea = document.querySelector('#aichat-input.ui-textarea');
+                if (textarea)
+                    textarea.focus();
+            });
+        }
+        getWidgetJSON() {
+            return {
+                id: 'aichat-main',
+                type: 'container',
+                vertical: true,
+                children: [
+                    this.getHeaderJSON(),
+                    this.getMessagesAreaJSON(),
+                    this.getHintJSON(),
+                    this.getTonePickerJSON(),
+                    this.getInputJSON(),
+                ],
+            };
+        }
+        getEUNoticeJSON() {
+            const model = app.map.aiModelName || '';
+            const text = model
+                ? _('Content generated by an external AI service ({0}). Please review before use.').replace('{0}', model)
+                : _('Content generated by an external AI service. Please review before use.');
+            const ratingLetter = app.map.aiEthicalRating || 'U';
+            return {
+                id: 'aichat-eu-wrapper',
+                type: 'container',
+                horizontal: true,
+                children: [
+                    {
+                        id: 'aichat-rating-badge',
+                        type: 'fixedtext',
+                        text: ratingLetter,
+                        enabled: true,
+                    },
+                    {
+                        id: 'aichat-eu-notice',
+                        type: 'fixedtext',
+                        text: text,
+                        enabled: true,
+                    },
+                ],
+            };
+        }
+        getHintJSON() {
+            return {
+                id: 'aichat-hint',
+                type: 'fixedtext',
+                text: this.hintText || '',
+                enabled: true,
+                visible: !!this.hintText,
+                allyRole: 'status',
+                ariaLive: 'polite',
+            };
+        }
+        // JSDialog builder only creates a wrapper div for containers
+        // with >1 children; add a spacer to guarantee the div exists.
+        ensureContainerChildren(children, idPrefix) {
+            if (children.length < 2) {
+                children.push({
+                    id: idPrefix + '-spacer',
+                    type: 'fixedtext',
+                    text: '',
+                    enabled: true,
+                });
+            }
+        }
+        getHeaderJSON() {
+            return {
+                id: 'aichat-header',
+                type: 'container',
+                horizontal: true,
+                children: [
+                    {
+                        id: 'aichat-header-icon',
+                        type: 'image',
+                        image: app.LOUtil.getImageURL(this.ICON_SPARKLE),
+                        text: '',
+                    },
+                    {
+                        id: 'aichat-title',
+                        type: 'fixedtext',
+                        text: _('AI Assistant'),
+                        enabled: true,
+                    },
+                    {
+                        id: 'aichat-clear-btn',
+                        type: 'pushbutton',
+                        image: this.ICON_TRASH,
+                        enabled: this.messages.length > 0,
+                        aria: { label: _('New conversation') },
+                    },
+                    {
+                        id: 'aichat-close-btn',
+                        type: 'pushbutton',
+                        image: this.ICON_CLOSE,
+                        enabled: true,
+                        aria: { label: _('Close') },
+                    },
+                ],
+            };
+        }
+        getEmptyStateQuestion() {
+            switch (app.map.getDocType()) {
+                case 'spreadsheet':
+                    return _('What would you like to do with this spreadsheet?');
+                case 'presentation':
+                    return _('What would you like to do with this presentation?');
+                case 'drawing':
+                    return _('What would you like to do with this drawing?');
+                default:
+                    return _('What would you like to do with this document?');
+            }
+        }
+        // The first name of the user, or an empty string for a guest, an anonymous user, or a
+        // user whose storage gave no name.
+        getUserFirstName() {
+            if (app.map.wopi && app.map.wopi.IsAnonymousUser)
+                return '';
+            if (app.map.welcome && app.map.welcome.isGuest())
+                return '';
+            const docLayer = app.map._docLayer;
+            if (!docLayer)
+                return '';
+            const name = (app.map.getViewName(docLayer._viewId) || '').trim();
+            // The server names a user without a friendly name UnknownUser, or LocalUser#<id>
+            // when the document comes from local storage.
+            if (name === 'UnknownUser' || name.startsWith('LocalUser#'))
+                return '';
+            return name.split(/\s+/)[0];
+        }
+        // The greeting follows the local time of the browser: morning from 05:00 to 11:59,
+        // afternoon from 12:00 to 17:59 and evening from 18:00 to 04:59. It is HTML, with the
+        // name in a span of class aichat-greeting-name and every piece of text escaped.
+        getGreetingHtml() {
+            const hour = new Date().getHours();
+            const name = this.getUserFirstName();
+            let withName;
+            let withoutName;
+            if (hour >= 5 && hour < 12) {
+                withName = _('Good morning, {0}');
+                withoutName = _('Good morning');
+            }
+            else if (hour >= 12 && hour < 18) {
+                withName = _('Good afternoon, {0}');
+                withoutName = _('Good afternoon');
+            }
+            else {
+                withName = _('Good evening, {0}');
+                withoutName = _('Good evening');
+            }
+            const escape = app.LOUtil.escapeHtml;
+            if (!name)
+                return escape(withoutName);
+            const nameHtml = '<span class="aichat-greeting-name">' + escape(name) + '</span>';
+            return withName.split('{0}').map(escape).join(nameHtml);
+        }
+        getMessagesListJSON() {
+            const children = [];
+            if (this.messages.length === 0) {
+                children.push({
+                    id: 'aichat-empty-title',
+                    type: 'container',
+                    vertical: true,
+                    children: [
+                        {
+                            id: 'aichat-empty-state-greeting',
+                            type: 'fixedtext',
+                            html: app.LOUtil.sanitize(this.getGreetingHtml()),
+                            enabled: true,
+                        },
+                        {
+                            id: 'aichat-empty-state',
+                            type: 'fixedtext',
+                            text: this.getEmptyStateQuestion(),
+                            enabled: true,
+                        },
+                    ],
+                });
+                children.push(this.getPromptChipsJSON());
+            }
+            else {
+                for (let i = 0; i < this.messages.length; i++) {
+                    children.push(this.getMessageJSON(this.messages[i], i));
+                }
+            }
+            this.ensureContainerChildren(children, 'aichat-messages');
+            return {
+                id: 'aichat-messages-list',
+                type: 'container',
+                vertical: true,
+                children: children,
+            };
+        }
+        getLoadingDotsJSON() {
+            // Until the first progress message arrives, the row says the assistant is thinking.
+            const text = this.progressText || _('Thinking...');
+            const children = [
+                {
+                    id: 'aichat-progress-text',
+                    type: 'fixedtext',
+                    text: text,
+                    enabled: true,
+                },
+            ];
+            this.ensureContainerChildren(children, 'aichat-loading-dots');
+            return {
+                id: 'aichat-loading-dots',
+                type: 'container',
+                horizontal: true,
+                visible: this.isProcessing,
+                allyRole: 'status',
+                ariaLive: 'polite',
+                aria: { label: text },
+                children: children,
+            };
+        }
+        getMessagesAreaJSON() {
+            return {
+                id: 'aichat-messages-area',
+                type: 'container',
+                vertical: true,
+                children: [this.getMessagesListJSON(), this.getLoadingDotsJSON()],
+                allyRole: 'log',
+                ariaLive: 'polite',
+                aria: { label: _('Chat messages') },
+            };
+        }
+        looksLikeQuestion(text) {
+            return /\?\s*$/.test(text);
+        }
+        getMessageJSON(msg, index) {
+            const isUser = msg.role === 'user';
+            const children = [];
+            if (isUser && msg.selectedText) {
+                children.push({
+                    id: 'aichat-context-' + index,
+                    type: 'fixedtext',
+                    html: app.LOUtil.sanitize(this.markdownToHtml(msg.selectedText)),
+                    enabled: true,
+                });
+            }
+            if (msg.imageData) {
+                // Image message
+                children.push({
+                    id: `aichat-msg-text-${index}`,
+                    type: 'fixedtext',
+                    html: app.LOUtil.sanitize('<img src="data:image/png;base64,' +
+                        msg.imageData +
+                        '" alt="' +
+                        _('AI generated image') +
+                        '" class="aichat-generated-image" />'),
+                    enabled: true,
+                });
+                children.push(this.getImageActionsJSON(index));
+            }
+            else {
+                // Text message content - use displayContent for UI, content for API
+                const displayText = msg.displayContent || msg.content;
+                if (isUser || msg.isError) {
+                    children.push({
+                        id: `aichat-msg-text-${index}`,
+                        type: 'fixedtext',
+                        text: displayText,
+                        enabled: true,
+                    });
+                }
+                else {
+                    children.push({
+                        id: `aichat-msg-text-${index}`,
+                        type: 'fixedtext',
+                        html: app.LOUtil.sanitize(this.markdownToHtml(displayText)),
+                        enabled: true,
+                    });
+                }
+                // Action buttons for text assistant messages (skip approval and
+                // outline messages, which carry their own controls). A reply
+                // that reads as a question is not document content, so it gets
+                // Copy but no Insert.
+                if (!isUser && !msg.isError && !msg.isApproval && !msg.isOutline) {
+                    const showInsert = !this.looksLikeQuestion(displayText);
+                    children.push(this.getActionsJSON(index, showInsert));
+                }
+                // Retry button for error messages
+                if (msg.isError) {
+                    children.push({
+                        id: `aichat-retry-${index}`,
+                        type: 'pushbutton',
+                        text: _('Retry'),
+                        enabled: true,
+                    });
+                }
+            }
+            this.ensureContainerChildren(children, `aichat-msg-${index}`);
+            return {
+                id: `aichat-msg-${index}`,
+                type: 'container',
+                vertical: true,
+                children: children,
+            };
+        }
+        getActionsJSON(index, showInsert) {
+            const children = [];
+            if (showInsert) {
+                children.push({
+                    id: `aichat-insert-text-${index}`,
+                    type: 'pushbutton',
+                    icon: this.ICON_INSERT,
+                    text: _('Insert'),
+                    aria: { label: _('Insert at cursor') },
+                });
+            }
+            children.push({
+                id: `aichat-copy-text-${index}`,
+                type: 'pushbutton',
+                image: 'lc_copy.svg',
+                enabled: true,
+                aria: { label: _('Copy to clipboard') },
+            });
+            this.ensureContainerChildren(children, `aichat-actions-${index}`);
+            return {
+                id: `aichat-actions-${index}`,
+                type: 'container',
+                horizontal: true,
+                children: children,
+            };
+        }
+        getImageActionsJSON(index) {
+            return {
+                id: `aichat-actions-${index}`,
+                type: 'container',
+                horizontal: true,
+                children: [
+                    {
+                        id: `aichat-insert-img-${index}`,
+                        type: 'pushbutton',
+                        icon: this.ICON_INSERT,
+                        text: _('Insert'),
+                        enabled: true,
+                        aria: { label: _('Insert at cursor') },
+                    },
+                    {
+                        id: `aichat-copy-img-${index}`,
+                        type: 'pushbutton',
+                        image: 'lc_copy.svg',
+                        enabled: true,
+                        aria: { label: _('Copy to clipboard') },
+                    },
+                ],
+            };
+        }
+        getInputJSON() {
+            return {
+                id: 'aichat-input-area',
+                type: 'container',
+                vertical: true,
+                children: [
+                    {
+                        id: 'aichat-input-container',
+                        type: 'container',
+                        vertical: true,
+                        children: [
+                            {
+                                id: 'aichat-selection-context',
+                                type: 'fixedtext',
+                                text: '\u2726 ' + _('Using selected text as context'),
+                                enabled: true,
+                            },
+                            {
+                                id: 'aichat-input',
+                                type: 'multilineedit',
+                                text: this.inputText,
+                                placeholder: _('Ask AI...'),
+                                cursor: true,
+                                enabled: !this.isProcessing,
+                                aria: { label: _('Message input') },
+                            },
+                            {
+                                id: 'aichat-input-toolbar',
+                                type: 'container',
+                                horizontal: true,
+                                children: [
+                                    this.getToneChipJSON(),
+                                    {
+                                        id: 'aichat-send-btn',
+                                        type: 'pushbutton',
+                                        image: this.isProcessing ? this.ICON_STOP : this.ICON_SEND,
+                                        enabled: this.isProcessing || this.inputText.trim().length > 0,
+                                        aria: {
+                                            label: this.isProcessing
+                                                ? _('Stop generating')
+                                                : _('Send message'),
+                                        },
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                    this.getEUNoticeJSON(),
+                ],
+            };
+        }
+        getToneChipLabel() {
+            // Caret points up while the picker is open, down while closed.
+            const caret = this.tonePickerOpen ? ' ▴' : ' ▾';
+            if (this.selectedTone === null) {
+                return _('Set tone') + caret;
+            }
+            const preset = this.TONE_PRESETS.find((p) => p.id === this.selectedTone);
+            if (preset) {
+                if (this.emojify) {
+                    return preset.icon + ' ' + preset.label + caret;
+                }
+                return preset.label + caret;
+            }
+            const custom = this.findCustomTone(this.selectedTone);
+            if (custom) {
+                return custom.icon + ' ' + custom.name + caret;
+            }
+            return _('Set tone') + caret;
+        }
+        getToneChipJSON() {
+            let name = '';
+            const preset = this.TONE_PRESETS.find((p) => p.id === this.selectedTone);
+            if (preset)
+                name = preset.label;
+            else if (this.selectedTone)
+                name = this.findCustomTone(this.selectedTone)?.name || '';
+            const ariaLabel = this.selectedTone === null
+                ? _('Set tone of voice')
+                : _('Tone of voice: {0}{1}')
+                    .replace('{0}', name)
+                    .replace('{1}', this.emojify ? ' ' + _('with emoji') : '');
+            return {
+                id: 'aichat-tone-chip',
+                type: 'pushbutton',
+                text: this.getToneChipLabel(),
+                enabled: !this.isProcessing,
+                aria: {
+                    label: ariaLabel,
+                    expanded: this.tonePickerOpen,
+                    haspopup: true,
+                },
+            };
+        }
+        getTonePickerJSON() {
+            if (this.formOpen) {
+                // JSDialog only wraps a container with >1 children in its own
+                // <div>; without that wrapper, updateWidget would replace the
+                // picker element with the form/confirm element (and
+                // #aichat-tone-picker would vanish from the DOM, breaking
+                // later rebuilds and follow-up click handlers).
+                const inner = this.deleteConfirmOpen
+                    ? this.getToneDeleteConfirmJSON()
+                    : this.getToneFormJSON();
+                const children = [inner];
+                this.ensureContainerChildren(children, 'aichat-tone-picker');
+                return {
+                    id: 'aichat-tone-picker',
+                    type: 'container',
+                    vertical: true,
+                    children: children,
+                };
+            }
+            const presetChildren = this.TONE_PRESETS.map((p) => ({
+                id: 'aichat-tone-preset-' + p.id,
+                type: 'chip',
+                text: p.label,
+                icon: p.icon,
+                pressed: this.selectedTone === p.id,
+                enabled: true,
+                aria: {
+                    label: this.toneAriaLabel(p.label),
+                },
+            }));
+            const children = [
+                {
+                    id: 'aichat-tone-picker-header',
+                    type: 'container',
+                    horizontal: true,
+                    children: [
+                        {
+                            id: 'aichat-tone-title',
+                            type: 'fixedtext',
+                            text: _('Tone of voice'),
+                            enabled: true,
+                        },
+                        {
+                            id: 'aichat-tone-reset',
+                            type: 'pushbutton',
+                            text: _('Reset voice'),
+                            image: app.LOUtil.getImageURL(this.ICON_CLOSE),
+                            enabled: true,
+                            aria: { label: _('Reset tone of voice') },
+                        },
+                    ],
+                },
+                {
+                    id: 'aichat-tone-presets',
+                    type: 'container',
+                    horizontal: true,
+                    children: presetChildren,
+                },
+            ];
+            if (this.customTones.length > 0) {
+                children.push({
+                    id: 'aichat-tone-your-tones-label',
+                    type: 'fixedtext',
+                    text: _('Your tones'),
+                    enabled: true,
+                });
+                const customChildren = [];
+                for (const t of this.customTones) {
+                    customChildren.push({
+                        id: 'aichat-tone-custom-' + t.id,
+                        type: 'chip',
+                        text: t.name,
+                        icon: t.icon,
+                        pressed: this.selectedTone === t.id,
+                        enabled: true,
+                        aria: { label: this.toneAriaLabel(t.name) },
+                        actions: [
+                            {
+                                id: 'aichat-tone-edit-' + t.id,
+                                text: '✎',
+                                aria: { label: _('Edit tone') },
+                            },
+                        ],
+                    });
+                }
+                children.push({
+                    id: 'aichat-tone-customs',
+                    type: 'container',
+                    horizontal: true,
+                    children: customChildren,
+                });
+            }
+            const canAddMore = this.customTones.length < this.MAX_CUSTOM_TONES;
+            children.push({
+                id: 'aichat-tone-add',
+                type: 'pushbutton',
+                text: _('+ Add my own voice'),
+                enabled: canAddMore && !this.isProcessing,
+                aria: { label: _('Add a custom tone of voice') },
+            });
+            children.push({
+                id: 'aichat-tone-emojify-row',
+                type: 'container',
+                horizontal: true,
+                children: [
+                    {
+                        id: 'aichat-tone-emojify-label',
+                        type: 'fixedtext',
+                        text: '😌  ' + _('Emojify'),
+                        enabled: true,
+                    },
+                    {
+                        id: 'aichat-tone-emojify',
+                        type: 'pushbutton',
+                        text: this.emojify ? _('On') : _('Off'),
+                        enabled: true,
+                        aria: {
+                            label: _('Toggle emojify'),
+                            pressed: this.emojify,
+                        },
+                    },
+                ],
+            });
+            return {
+                id: 'aichat-tone-picker',
+                type: 'container',
+                vertical: true,
+                children: children,
+            };
+        }
+        updateToneChip() {
+            this.builder.updateWidget(this.container, this.getToneChipJSON());
+        }
+        updateTonePicker() {
+            this.builder.updateWidget(this.container, this.getTonePickerJSON());
+            // updateWidget may have recreated the DOM subtree, so re-apply the
+            // open-state class synchronously to avoid the picker flashing hidden.
+            this.setTonePickerOpenClass(this.tonePickerOpen);
+            if (this.tonePickerOpen) {
+                app.layoutingService.onDrain(() => this.setTonePickerOpenClass(this.tonePickerOpen));
+            }
+        }
+        focusToneChip() {
+            requestAnimationFrame(() => {
+                const btn = document.querySelector('#aichat-tone-chip button.ui-pushbutton');
+                if (btn)
+                    btn.focus();
+            });
+        }
+        focusInitialPreset() {
+            app.layoutingService.onDrain(() => {
+                const targetId = 'aichat-tone-preset-' + (this.selectedTone || 'natural');
+                const btn = document.querySelector('#' + targetId + ' .ui-chip-main');
+                if (btn)
+                    btn.focus();
+            });
+        }
+        setTonePickerOpenClass(open) {
+            const picker = document.getElementById('aichat-tone-picker');
+            if (!picker)
+                return;
+            picker.classList.toggle('aichat-tone-picker-open', open);
+        }
+        // #aichat-main scrolls whenever the panel is taller than the dock, which
+        // is what happens at high browser zoom or in a short window. The tone
+        // picker sits near the bottom of that scroller, so an opening picker has
+        // to be scrolled to. Called only on the transitions that make the picker
+        // the centre of attention - not on every repaint of it, which would yank
+        // the view away while the user clicks around inside.
+        scrollTonePickerIntoView() {
+            app.layoutingService.onDrain(() => {
+                const main = document.getElementById('aichat-main');
+                const picker = document.getElementById('aichat-tone-picker');
+                if (!main || !picker)
+                    return;
+                const mainRect = main.getBoundingClientRect();
+                const rect = picker.getBoundingClientRect();
+                // The header is sticky, so the usable top edge sits below it.
+                const header = document.getElementById('aichat-header');
+                const top = mainRect.top + (header ? header.getBoundingClientRect().height : 0);
+                const hiddenAbove = rect.top < top - 1;
+                const overflowsBelow = rect.bottom > mainRect.bottom + 1;
+                if (!hiddenAbove && !overflowsBelow)
+                    return;
+                // Nudge it up if it fits; align its top when it is taller than
+                // the visible area, so the title and presets show first.
+                const delta = overflowsBelow && !hiddenAbove && rect.height <= mainRect.bottom - top
+                    ? rect.bottom - mainRect.bottom
+                    : rect.top - top;
+                main.scrollTo({
+                    top: main.scrollTop + delta,
+                    behavior: 'smooth',
+                });
+            });
+        }
+        openTonePicker() {
+            if (this.tonePickerOpen || this.isProcessing)
+                return;
+            this.tonePickerOpen = true;
+            this.setTonePickerOpenClass(true);
+            this.updateToneChip();
+            this.focusInitialPreset();
+            this.scrollTonePickerIntoView();
+        }
+        closeTonePicker() {
+            if (!this.tonePickerOpen)
+                return;
+            this.tonePickerOpen = false;
+            this.formOpen = false;
+            this.formDraft = null;
+            this.deleteConfirmOpen = false;
+            this.closeEmojiPicker();
+            this.setTonePickerOpenClass(false);
+            this.updateTonePicker();
+            this.updateToneChip();
+            this.focusToneChip();
+        }
+        toggleTonePicker() {
+            if (this.tonePickerOpen) {
+                this.closeTonePicker();
+            }
+            else {
+                this.openTonePicker();
+            }
+        }
+        selectTone(tone) {
+            this.selectedTone = tone;
+            this.saveSelectedTone();
+            this.updateTonePicker();
+            this.closeTonePicker();
+        }
+        setEmojify(value) {
+            this.emojify = value;
+            this.saveEmojify();
+            this.updateToneChip();
+            this.updateTonePicker();
+        }
+        // In-memory clear only. Used when the sidebar needs to forget its
+        // current selection for the duration of the session (e.g. on a
+        // failed document load) without burning the user's persisted
+        // preference.
+        resetVoiceState() {
+            this.selectedTone = null;
+            this.emojify = false;
+            this.updateToneChip();
+            this.updateTonePicker();
+        }
+        // Explicit user-driven reset: clears in-memory state AND persists
+        // the cleared values so the choice survives a reload.
+        resetVoice() {
+            this.resetVoiceState();
+            this.saveSelectedTone();
+            this.saveEmojify();
+        }
+        // Build the visible icon row: pin the current draft icon to slot 0
+        // so the aria-pressed highlight is meaningful (especially in edit
+        // mode where the existing icon may not be in `recentIcons`), then
+        // fill the remaining slots from the persisted recents and defaults.
+        // The row is cached in `formIconRow` and only rebuilt when the form
+        // reopens or a new emoji is pulled in from the full picker - this
+        // prevents the row from reshuffling while the user is clicking on
+        // it, which would cause aria-pressed to land on the wrong DOM slot.
+        rebuildFormIconRow() {
+            const draft = this.formDraft;
+            const row = [];
+            if (draft && draft.icon)
+                row.push(draft.icon);
+            for (const e of this.recentIcons) {
+                if (row.length >= this.ICON_ROW_LEN)
+                    break;
+                if (!row.includes(e))
+                    row.push(e);
+            }
+            while (row.length < this.ICON_ROW_LEN) {
+                const fallback = this.DEFAULT_TONE_ICONS.find((e) => !row.includes(e));
+                if (!fallback)
+                    break;
+                row.push(fallback);
+            }
+            this.formIconRow = row;
+        }
+        getToneFormJSON() {
+            const draft = this.formDraft || {
+                id: '',
+                name: '',
+                icon: this.recentIcons[0] || this.DEFAULT_TONE_ICONS[0],
+                description: '',
+            };
+            const rowIcons = this.formIconRow;
+            const iconChildren = [];
+            for (let i = 0; i < rowIcons.length; i++) {
+                iconChildren.push({
+                    id: 'aichat-tone-form-icon-' + i,
+                    type: 'pushbutton',
+                    text: rowIcons[i],
+                    enabled: true,
+                    aria: {
+                        label: _('Use icon') + ' ' + rowIcons[i],
+                        pressed: rowIcons[i] === draft.icon,
+                    },
+                });
+            }
+            iconChildren.push({
+                id: 'aichat-tone-form-emoji-more',
+                type: 'pushbutton',
+                text: '+',
+                enabled: true,
+                aria: { label: _('Pick another emoji') },
+            });
+            const formChildren = [
+                {
+                    id: 'aichat-tone-form-header',
+                    type: 'container',
+                    horizontal: true,
+                    children: [
+                        {
+                            id: 'aichat-tone-form-back',
+                            type: 'pushbutton',
+                            text: '←',
+                            enabled: true,
+                            aria: { label: _('Back to tones') },
+                        },
+                        {
+                            id: 'aichat-tone-form-title',
+                            type: 'fixedtext',
+                            text: _('Tone of voice'),
+                            enabled: true,
+                        },
+                    ],
+                },
+                {
+                    id: 'aichat-tone-form-icon-label',
+                    type: 'fixedtext',
+                    text: _('Icon'),
+                    enabled: true,
+                },
+                {
+                    id: 'aichat-tone-form-icons',
+                    type: 'container',
+                    horizontal: true,
+                    children: iconChildren,
+                },
+                {
+                    id: 'aichat-tone-form-name-label',
+                    type: 'fixedtext',
+                    text: _('Name your tone'),
+                    enabled: true,
+                },
+                {
+                    id: 'aichat-tone-form-name',
+                    type: 'edit',
+                    text: draft.name,
+                    placeholder: _('e.g. Quick reply'),
+                    enabled: true,
+                    aria: { label: _('Tone name') },
+                },
+                {
+                    id: 'aichat-tone-form-desc-label',
+                    type: 'fixedtext',
+                    text: _('Describe how AI should write'),
+                    enabled: true,
+                },
+                {
+                    id: 'aichat-tone-form-desc',
+                    type: 'multilineedit',
+                    text: draft.description,
+                    placeholder: _('Write short, direct sentences. Use plain language and skip the small talk.'),
+                    cursor: true,
+                    enabled: true,
+                    aria: { label: _('Tone description') },
+                },
+            ];
+            const actionChildren = [];
+            if (this.formMode === 'edit') {
+                actionChildren.push({
+                    id: 'aichat-tone-form-delete',
+                    type: 'pushbutton',
+                    text: _('Delete tone'),
+                    enabled: true,
+                    aria: { label: _('Delete this tone') },
+                });
+            }
+            actionChildren.push({
+                id: 'aichat-tone-form-cancel',
+                type: 'pushbutton',
+                text: _('Cancel'),
+                enabled: true,
+                aria: { label: _('Cancel') },
+            });
+            actionChildren.push({
+                id: 'aichat-tone-form-save',
+                type: 'pushbutton',
+                text: _('Save voice'),
+                enabled: this.canSaveForm(),
+                aria: { label: _('Save tone of voice') },
+            });
+            formChildren.push({
+                id: 'aichat-tone-form-actions',
+                type: 'container',
+                horizontal: true,
+                children: actionChildren,
+            });
+            if (this.emojiPickerOpen) {
+                formChildren.push({
+                    id: 'aichat-tone-form-emoji-picker',
+                    type: 'emojipicker',
+                    recentsPrefsKey: 'aichat.emojiPickerRecents',
+                    searchPlaceholder: _('Search emojis'),
+                    aria: { label: _('Choose an emoji') },
+                });
+            }
+            return {
+                id: 'aichat-tone-form',
+                type: 'container',
+                vertical: true,
+                children: formChildren,
+            };
+        }
+        getToneDeleteConfirmJSON() {
+            const draft = this.formDraft || {
+                id: '',
+                name: '',
+                icon: this.DEFAULT_TONE_ICONS[0],
+                description: '',
+            };
+            return {
+                id: 'aichat-tone-delete-confirm',
+                type: 'container',
+                vertical: true,
+                allyRole: 'group',
+                aria: { label: _('Delete tone confirmation') },
+                children: [
+                    {
+                        id: 'aichat-tone-delete-confirm-title',
+                        type: 'fixedtext',
+                        text: _('Delete tone'),
+                        enabled: true,
+                    },
+                    {
+                        id: 'aichat-tone-delete-confirm-desc',
+                        type: 'fixedtext',
+                        text: _('This tone of voice will be deleted'),
+                        enabled: true,
+                    },
+                    {
+                        id: 'aichat-tone-delete-confirm-preview',
+                        type: 'container',
+                        horizontal: true,
+                        children: [
+                            {
+                                id: 'aichat-tone-delete-confirm-chip',
+                                type: 'chip',
+                                text: draft.name,
+                                icon: draft.icon,
+                                pressed: false,
+                                enabled: true,
+                                aria: { label: this.toneAriaLabel(draft.name) },
+                            },
+                        ],
+                    },
+                    {
+                        id: 'aichat-tone-delete-confirm-actions',
+                        type: 'container',
+                        horizontal: true,
+                        children: [
+                            {
+                                id: 'aichat-tone-delete-confirm-cancel',
+                                type: 'pushbutton',
+                                text: _('Cancel'),
+                                enabled: true,
+                                aria: { label: _('Cancel delete') },
+                            },
+                            {
+                                id: 'aichat-tone-delete-confirm-ok',
+                                type: 'pushbutton',
+                                text: _('Delete'),
+                                enabled: true,
+                                aria: { label: _('Delete tone') },
+                            },
+                        ],
+                    },
+                ],
+            };
+        }
+        canSaveForm() {
+            if (!this.formDraft)
+                return false;
+            return (this.formDraft.name.trim().length > 0 &&
+                this.formDraft.description.trim().length > 0);
+        }
+        openToneForm(mode, id) {
+            if (this.isProcessing)
+                return;
+            if (mode === 'add' && this.customTones.length >= this.MAX_CUSTOM_TONES) {
+                this.hintText = _('You have reached the maximum of {0} custom tones.').replace('{0}', String(this.MAX_CUSTOM_TONES));
+                this.updateHint();
+                return;
+            }
+            if (mode === 'edit' && id) {
+                const existing = this.findCustomTone(id);
+                if (!existing)
+                    return;
+                this.formDraft = { ...existing };
+                this.formMode = 'edit';
+            }
+            else {
+                this.formDraft = {
+                    id: '',
+                    name: '',
+                    icon: this.recentIcons[0] || this.DEFAULT_TONE_ICONS[0],
+                    description: '',
+                };
+                this.formMode = 'add';
+            }
+            this.formOpen = true;
+            this.tonePickerOpen = true;
+            this.emojiPickerOpen = false;
+            this.rebuildFormIconRow();
+            this.updateTonePicker();
+            this.focusFormName();
+            this.scrollTonePickerIntoView();
+        }
+        closeToneForm() {
+            this.formOpen = false;
+            this.formDraft = null;
+            this.deleteConfirmOpen = false;
+            this.closeEmojiPicker();
+            this.updateTonePicker();
+        }
+        saveToneForm() {
+            if (!this.formDraft || !this.canSaveForm())
+                return;
+            const name = this.formDraft.name.trim().slice(0, this.MAX_TONE_NAME_LEN);
+            const description = this.formDraft.description
+                .trim()
+                .slice(0, this.MAX_TONE_DESC_LEN);
+            const icon = this.formDraft.icon ||
+                this.recentIcons[0] ||
+                this.DEFAULT_TONE_ICONS[0];
+            if (this.formMode === 'edit') {
+                const draftId = this.formDraft.id;
+                const idx = this.customTones.findIndex((t) => t.id === draftId);
+                if (idx >= 0) {
+                    this.customTones[idx] = {
+                        id: draftId,
+                        name,
+                        icon,
+                        description,
+                    };
+                }
+            }
+            else {
+                if (this.customTones.length >= this.MAX_CUSTOM_TONES) {
+                    this.hintText = _('You have reached the maximum of {0} custom tones.').replace('{0}', String(this.MAX_CUSTOM_TONES));
+                    this.updateHint();
+                    return;
+                }
+                const newTone = {
+                    id: this.generateToneId(),
+                    name,
+                    icon,
+                    description,
+                };
+                this.customTones.push(newTone);
+                this.selectedTone = newTone.id;
+                this.saveSelectedTone();
+            }
+            this.saveCustomTones();
+            this.formOpen = false;
+            this.formDraft = null;
+            this.updateToneChip();
+            this.updateTonePicker();
+        }
+        openDeleteConfirm() {
+            if (!this.formDraft || this.formMode !== 'edit')
+                return;
+            if (this.deleteConfirmOpen)
+                return;
+            this.deleteConfirmOpen = true;
+            this.closeEmojiPicker();
+            this.updateTonePicker();
+            this.focusDeleteConfirmCancel();
+            this.scrollTonePickerIntoView();
+        }
+        closeDeleteConfirm() {
+            if (!this.deleteConfirmOpen)
+                return;
+            this.deleteConfirmOpen = false;
+            this.updateTonePicker();
+            this.focusFormDeleteButton();
+        }
+        confirmDeleteTone() {
+            if (!this.formDraft || this.formMode !== 'edit')
+                return;
+            const id = this.formDraft.id;
+            this.customTones = this.customTones.filter((t) => t.id !== id);
+            this.saveCustomTones();
+            if (this.selectedTone === id) {
+                this.selectedTone = null;
+                this.saveSelectedTone();
+            }
+            this.deleteConfirmOpen = false;
+            this.formOpen = false;
+            this.formDraft = null;
+            this.updateToneChip();
+            this.updateTonePicker();
+        }
+        focusDeleteConfirmCancel() {
+            app.layoutingService.onDrain(() => {
+                const btn = document.querySelector('#aichat-tone-delete-confirm-cancel button.ui-pushbutton');
+                if (btn)
+                    btn.focus();
+            });
+        }
+        focusFormDeleteButton() {
+            app.layoutingService.onDrain(() => {
+                const btn = document.querySelector('#aichat-tone-form-delete button.ui-pushbutton');
+                if (btn)
+                    btn.focus();
+            });
+        }
+        focusFormName() {
+            app.layoutingService.onDrain(() => {
+                const el = document.querySelector('#aichat-tone-form-name input');
+                if (el)
+                    el.focus();
+            });
+        }
+        handleToneFormInput(id, data) {
+            if (!this.formDraft)
+                return;
+            if (id === 'aichat-tone-form-name') {
+                const value = String(data).slice(0, this.MAX_TONE_NAME_LEN);
+                this.formDraft.name = value;
+                this.refreshFormSaveEnabled();
+            }
+            else if (id === 'aichat-tone-form-desc') {
+                let value = String(data);
+                if (value.length > this.MAX_TONE_DESC_LEN) {
+                    value = value.slice(0, this.MAX_TONE_DESC_LEN);
+                    const ta = document.querySelector('#aichat-tone-form-desc.ui-textarea');
+                    if (ta)
+                        ta.value = value;
+                }
+                this.formDraft.description = value;
+                this.refreshFormSaveEnabled();
+            }
+        }
+        refreshFormSaveEnabled() {
+            const btn = document.querySelector('#aichat-tone-form-save button.ui-pushbutton');
+            if (!btn)
+                return;
+            if (this.canSaveForm()) {
+                btn.removeAttribute('disabled');
+            }
+            else {
+                btn.setAttribute('disabled', 'true');
+            }
+        }
+        selectFormIcon(index) {
+            if (!this.formDraft)
+                return;
+            const icon = this.formIconRow[index];
+            if (!icon)
+                return;
+            this.formDraft.icon = icon;
+            // The picker JSON now carries aria.pressed per icon, so a
+            // rebuild repaints the highlight. updateWidget restores focus
+            // to the clicked button via its preserved id, and the form
+            // fields' values come from formDraft so no typed input is lost.
+            this.updateTonePicker();
+        }
+        openEmojiPicker() {
+            if (this.emojiPickerOpen)
+                return;
+            this.emojiPickerOpen = true;
+            this.updateTonePicker();
+            // The overlay is anchored to the picker's top, so the picker has to
+            // be on screen for it to be usable in a scrolled panel.
+            this.scrollTonePickerIntoView();
+        }
+        closeEmojiPicker() {
+            if (!this.emojiPickerOpen)
+                return;
+            this.emojiPickerOpen = false;
+            this.updateTonePicker();
+            this.focusEmojiMoreButton();
+        }
+        focusEmojiMoreButton() {
+            app.layoutingService.onDrain(() => {
+                const btn = document.querySelector('#aichat-tone-form-emoji-more button.ui-pushbutton');
+                if (btn)
+                    btn.focus();
+            });
+        }
+        applyEmojiToForm(emoji) {
+            if (!this.formDraft)
+                return;
+            this.formDraft.icon = emoji;
+            // Promote to front of the 8-slot tone icon row, dedupe, cap, and
+            // top up from defaults if needed. The widget keeps its own
+            // (broader) recents bucket under aichat.emojiPickerRecents.
+            const next = [emoji, ...this.recentIcons.filter((e) => e !== emoji)];
+            this.recentIcons = next.slice(0, this.ICON_ROW_LEN);
+            while (this.recentIcons.length < this.ICON_ROW_LEN) {
+                const fallback = this.DEFAULT_TONE_ICONS.find((e) => !this.recentIcons.includes(e));
+                if (!fallback)
+                    break;
+                this.recentIcons.push(fallback);
+            }
+            this.saveRecentIcons();
+            this.rebuildFormIconRow();
+            this.closeEmojiPicker();
+        }
+        getPromptChipsJSON() {
+            const cardChildren = [];
+            if (app.map.getDocType() === 'spreadsheet') {
+                cardChildren.push({
+                    id: 'aichat-chip-formula-diagnosis',
+                    type: 'pushbutton',
+                    icon: 'lc_aichat_fix_formula.svg',
+                    text: _('Diagnose formula error'),
+                    enabled: true,
+                });
+                cardChildren.push({
+                    id: 'aichat-chip-sanity-check',
+                    type: 'pushbutton',
+                    icon: 'lc_aichat_cleanupdata.svg',
+                    text: _('Sanity check data'),
+                    enabled: true,
+                });
+                cardChildren.push({
+                    id: 'aichat-chip-create-formula',
+                    type: 'pushbutton',
+                    icon: 'lc_aichat_createformula.svg',
+                    text: _('Create a formula'),
+                    enabled: true,
+                });
+            }
+            else if (app.map.getDocType() === 'presentation') {
+                cardChildren.push({
+                    id: 'aichat-chip-create-slides',
+                    type: 'pushbutton',
+                    icon: 'lc_aichat_createslides.svg',
+                    text: _('Create slides'),
+                    enabled: true,
+                });
+            }
+            // Count doc-specific chips toward the initial limit so
+            // Calc (3 specific) and Writer (0 specific) show the same
+            // total number of chips before "See more".
+            const specificCount = cardChildren.length;
+            const collapsedGenericCount = Math.max(0, this.INITIAL_CARDS_SHOWN - specificCount);
+            const genericToShow = this.showAllCards
+                ? this.PROMPT_CARDS.length
+                : collapsedGenericCount;
+            for (let i = 0; i < genericToShow && i < this.PROMPT_CARDS.length; i++) {
+                const card = this.PROMPT_CARDS[i];
+                cardChildren.push({
+                    id: 'aichat-chip-' + i,
+                    type: 'pushbutton',
+                    icon: card.icon,
+                    text: card.prompt,
+                    enabled: true,
+                });
+            }
+            // "See more" / "See less" toggle
+            if (collapsedGenericCount < this.PROMPT_CARDS.length) {
+                cardChildren.push({
+                    id: 'aichat-see-more',
+                    type: 'pushbutton',
+                    text: this.showAllCards ? _('See less') : _('See more'),
+                    enabled: true,
+                });
+            }
+            return {
+                id: 'aichat-chips',
+                type: 'container',
+                vertical: true,
+                children: cardChildren,
+            };
+        }
+        parseActionIndex(id, prefix) {
+            return parseInt(id.substring(prefix.length), 10);
+        }
+        handleClick(id) {
+            // Exact-match actions
+            const exactActions = {
+                'aichat-send-btn': () => {
+                    if (this.isProcessing) {
+                        if (this.currentRequestId) {
+                            app.socket.sendMessage('aichatcancel: ' + this.currentRequestId);
+                        }
+                        this.isProcessing = false;
+                        this.currentRequestId = '';
+                        this.hintText = '';
+                        this.progressText = '';
+                        this.updateLoadingDots();
+                        this.updateInputArea();
+                    }
+                    else {
+                        this.sendMessage();
+                    }
+                },
+                'aichat-close-btn': () => this.hide(),
+                'aichat-clear-btn': () => this.clearConversation(),
+                'aichat-chip-formula-diagnosis': () => this.diagnoseFormulaError(),
+                'aichat-chip-sanity-check': () => this.sanityCheckData(),
+                'aichat-chip-create-formula': () => this.createFormula(),
+                'aichat-chip-create-slides': () => this.createSlides(),
+                'aichat-see-more': () => {
+                    this.showAllCards = !this.showAllCards;
+                    this.builder.updateWidget(this.container, this.getMessagesListJSON());
+                    app.layoutingService.onDrain(() => {
+                        this.applyCardStyles();
+                    });
+                },
+                'aichat-tone-chip': () => this.toggleTonePicker(),
+                'aichat-tone-reset': () => {
+                    this.resetVoice();
+                    this.closeTonePicker();
+                },
+                'aichat-tone-emojify': () => this.setEmojify(!this.emojify),
+                'aichat-tone-add': () => this.openToneForm('add'),
+                'aichat-tone-form-back': () => this.closeToneForm(),
+                'aichat-tone-form-cancel': () => this.closeToneForm(),
+                'aichat-tone-form-save': () => this.saveToneForm(),
+                'aichat-tone-form-delete': () => this.openDeleteConfirm(),
+                'aichat-tone-form-emoji-more': () => this.openEmojiPicker(),
+                'aichat-tone-delete-confirm-cancel': () => this.closeDeleteConfirm(),
+                'aichat-tone-delete-confirm-ok': () => this.confirmDeleteTone(),
+            };
+            if (exactActions[id]) {
+                exactActions[id]();
+                return;
+            }
+            if (id.startsWith('aichat-tone-preset-')) {
+                const toneId = id.substring('aichat-tone-preset-'.length);
+                const preset = this.TONE_PRESETS.find((p) => p.id === toneId);
+                if (preset) {
+                    this.selectTone(preset.id);
+                }
+                return;
+            }
+            if (id.startsWith('aichat-tone-edit-')) {
+                const toneId = id.substring('aichat-tone-edit-'.length);
+                this.openToneForm('edit', toneId);
+                return;
+            }
+            if (id.startsWith('aichat-tone-custom-')) {
+                const toneId = id.substring('aichat-tone-custom-'.length);
+                if (this.findCustomTone(toneId)) {
+                    this.selectTone(toneId);
+                }
+                return;
+            }
+            if (id.startsWith('aichat-tone-form-icon-')) {
+                const idx = parseInt(id.substring('aichat-tone-form-icon-'.length), 10);
+                if (!isNaN(idx)) {
+                    this.selectFormIcon(idx);
+                }
+                return;
+            }
+            // Prefix-based actions (order matters: longer prefixes first)
+            const prefixActions = [
+                {
+                    prefix: 'aichat-insert-img-',
+                    handler: (idx) => {
+                        const imgData = this.messages[idx]?.imageData;
+                        if (imgData) {
+                            this.insertImageAtCursor(imgData);
+                            this.showCopyFeedback(idx, 'aichat-insert-img-');
+                            this.showTransientHint(_('Image inserted at cursor'));
+                        }
+                    },
+                },
+                {
+                    prefix: 'aichat-copy-img-',
+                    handler: (idx) => {
+                        const imgData = this.messages[idx]?.imageData;
+                        if (imgData) {
+                            this.copyImageToClipboard(imgData, idx);
+                        }
+                    },
+                },
+                {
+                    prefix: 'aichat-insert-text-',
+                    handler: (idx) => {
+                        if (this.messages[idx]) {
+                            this.insertAtCursor(this.messages[idx].content);
+                            this.showCopyFeedback(idx, 'aichat-insert-text-');
+                            this.showTransientHint(_('Text inserted at cursor'));
+                        }
+                    },
+                },
+                {
+                    prefix: 'aichat-copy-text-',
+                    handler: (idx) => {
+                        if (this.messages[idx]) {
+                            this.copyToClipboard(this.messages[idx].content, idx);
+                        }
+                    },
+                },
+                {
+                    prefix: 'aichat-chip-',
+                    handler: (idx) => {
+                        if (this.PROMPT_CARDS[idx]) {
+                            this.inputText = this.PROMPT_CARDS[idx].prompt;
+                            this.sendMessage();
+                        }
+                    },
+                },
+                {
+                    prefix: 'aichat-retry-',
+                    handler: (idx) => {
+                        const userMsg = this.findPrecedingUserMessage(idx);
+                        if (userMsg) {
+                            const userIdx = this.messages.indexOf(userMsg);
+                            if (userIdx >= 0) {
+                                this.inputText = userMsg.displayContent || userMsg.content;
+                                // Remove the whole failed turn in one contiguous
+                                this.messages.splice(userIdx, idx - userIdx + 1);
+                                // Rebuild the list so index-keyed DOM elements match
+                                // the spliced array.
+                                this.updateMessagesArea();
+                                app.layoutingService.onDrain(() => this.sendMessage());
+                            }
+                        }
+                    },
+                },
+            ];
+            for (const { prefix, handler } of prefixActions) {
+                if (id.startsWith(prefix)) {
+                    handler(this.parseActionIndex(id, prefix));
+                    return;
+                }
+            }
+        }
+        handleInputChange(id, data) {
+            if (id === 'aichat-tone-form-name' || id === 'aichat-tone-form-desc') {
+                this.handleToneFormInput(id, data);
+                return;
+            }
+            if (id === 'aichat-tone-form-emoji-picker') {
+                this.applyEmojiToForm(String(data));
+                return;
+            }
+            if (id !== 'aichat-input')
+                return;
+            const prevEmpty = this.inputText.trim().length === 0;
+            this.inputText = data;
+            const nowEmpty = this.inputText.trim().length === 0;
+            if (prevEmpty !== nowEmpty) {
+                const sendBtn = document.querySelector('#aichat-send-btn button.ui-pushbutton');
+                if (sendBtn) {
+                    if (nowEmpty) {
+                        sendBtn.setAttribute('disabled', 'true');
+                    }
+                    else {
+                        sendBtn.removeAttribute('disabled');
+                    }
+                }
+            }
+            // Show warning when approaching message length limit
+            if (this.inputText.length > this.MAX_MESSAGE_LENGTH * 0.9) {
+                this.hintText = _('Approaching message length limit');
+                this.updateHint();
+            }
+            else if (this.hintText && this.hintText.includes('length')) {
+                this.hintText = '';
+                this.updateHint();
+            }
+            const textarea = document.querySelector('#aichat-input.ui-textarea');
+            if (textarea) {
+                textarea.style.height = 'auto';
+                textarea.style.height =
+                    Math.min(textarea.scrollHeight, this.TEXTAREA_MAX_HEIGHT_PX) + 'px';
+            }
+        }
+        jsdialogCallback(objectType, eventType, object, data, _builder) {
+            if (!object || !object.id)
+                return;
+            if (eventType === 'click') {
+                this.handleClick(object.id);
+            }
+            else if (eventType === 'change') {
+                this.handleInputChange(object.id, data);
+            }
+        }
+        // Needed for JSDialog builder compatibility (mobileWizard interface)
+        setTabs() {
+            // no-op: required by JSDialog builder mobileWizard interface
+        }
+        selectedTab() {
+            return 0;
+        }
+        get requestTimeoutMs() {
+            return (app.map.aiRequestTimeout ?? 300) * 1000;
+        }
+        get timeoutErrorMessage() {
+            return _('The request timed out. You can increase the request timeout in the AI section of the settings.');
+        }
+        // The server reports a failure as a stable errorCode plus an
+        // untranslated English fallback in data.error. The codes mirror the
+        // sendChatError() calls in wsd/AIChatSession.cpp; a message's variable
+        // part (for example the rejected host) arrives separately in
+        // data.errorArg and is interpolated into the translated string.
+        translateChatError(data, defaultError) {
+            const messages = {
+                requestTooLarge: () => _('Request too large'),
+                invalidRequestFormat: () => _('Invalid request format'),
+                requestSuperseded: () => _('Request superseded by a newer request'),
+                noMessages: () => _('No messages provided'),
+                messageTooLong: () => _('Message too long'),
+                aiDisabled: () => _('AI features are disabled by the administrator'),
+                aiNotAvailableForGuests: () => _('AI is not available for guests'),
+                aiDisabledForDocument: () => _('AI features are disabled for this document'),
+                aiNotConfigured: () => _('AI settings not configured'),
+                providerUrlInvalid: () => _('The AI provider URL is invalid, check the AI settings'),
+                imageProviderUrlInvalid: () => _('The AI image provider URL is invalid, check the AI settings'),
+                hostNotAllowed: () => _('Host "{0}" is not in the allowed host list, contact your administrator'),
+                networkError: () => _('Network error - please check your connection'),
+                requestTimeout: () => this.timeoutErrorMessage,
+                connectionFailed: () => _('Could not connect to the AI provider'),
+                noResponse: () => _('No response from AI'),
+                tooManyToolSteps: () => _('AI used too many tool steps'),
+                outOfTokens: () => _('The model ran out of tokens before producing output. Try a shorter input or a model with a larger output budget.'),
+                emptyResponse: () => _('The model returned an empty response (no tokens generated). This is usually a temporary provider issue - please retry, or try a different model.'),
+                imageNoPrompt: () => _('Image generation failed: no prompt from model'),
+                documentNotAvailable: () => _('Document not available'),
+                outlineInvalid: () => _('The edited outline is not valid: {0}'),
+                outlineNoSlides: () => _('Could not build any slides from the outline. Please try again.'),
+                imageSettingsNotConfigured: () => _('AI image settings not configured'),
+                imageModelNotConfigured: () => _('Image model not configured'),
+                imageGenFailed: () => _('Image generation failed: {0}'),
+                noImageGenerated: () => _('No image generated'),
+                aiBadResponse: () => _('Failed to parse the AI response'),
+                apiInvalidRequest: () => _('The AI provider rejected the request as invalid'),
+                apiInvalidKey: () => _('Invalid API key'),
+                apiKeyPermissions: () => _('API key lacks permissions'),
+                apiQuotaExceeded: () => _('API quota exceeded - check your plan and billing details'),
+                apiRateLimited: () => _('Rate limited - please wait a moment and retry'),
+                apiServerError: () => _('API server error - try again later'),
+                apiServiceUnavailable: () => _('Service temporarily unavailable'),
+                apiError: () => _('API error ({0})'),
+            };
+            const build = data.errorCode && messages[data.errorCode];
+            if (build)
+                return AIChatSidebar.interpolate(build(), [data.errorArg || '']);
+            // No code: an old server, or a locally synthesized error (see
+            // startRequestTimeout). Keep the pre-code remap of the bare
+            // timeout report to actionable guidance.
+            if (data.error === 'Request timeout')
+                return this.timeoutErrorMessage;
+            return data.error || defaultError;
+        }
+        // Replaces {0}, {1}, ... placeholders in a translated message with the
+        // variable parts the server sent alongside its message code.
+        static interpolate(msg, args) {
+            let result = msg;
+            for (let i = 0; i < args.length; i++)
+                result = result.replace('{' + i + '}', args[i]);
+            return result;
+        }
+        // The server reports tool progress as a stable statusKey plus an
+        // untranslated English fallback in data.status. The keys mirror the
+        // sendToolProgress() calls in wsd/AIChatSession.cpp; counters arrive
+        // separately in data.statusArgs.
+        translateProgress(data) {
+            const messages = {
+                extractingLinkTargets: () => _('Extracting link targets...'),
+                evaluatingFormula: () => _('Evaluating formula...'),
+                loadingFunctionCatalog: () => _('Loading function catalog...'),
+                thinking: () => _('Thinking...'),
+                working: () => _('Working...'),
+                settingFormulas: () => _('Setting formulas...'),
+                buildingSlide: () => _('Building slide {0} of {1}...'),
+                skippingSlide: () => _('Skipping slide {0}...'),
+                generatingImage: () => _('Generating image {0} of {1}...'),
+            };
+            const build = data.statusKey && messages[data.statusKey];
+            if (build)
+                return AIChatSidebar.interpolate(build(), data.statusArgs || []);
+            return data.status || '';
+        }
+        // A server-composed success message arrives as a stable displayCode
+        // plus an untranslated English fallback in data.displayContent (a
+        // model-written message has no code and is shown as sent). The codes
+        // mirror the sendChatResult() calls in wsd/AIChatSession.cpp;
+        // data.displayArgs carries the variable parts.
+        translateDisplay(data) {
+            const args = data.displayArgs || [];
+            switch (data.displayCode) {
+                case 'pickSection':
+                    return (_('This document is too large to read in full. Pick a section to focus on:') +
+                        '\n\n' +
+                        (args[0] || ''));
+                case 'narrowSheet':
+                    return (_('This sheet is too large to read in full. To narrow it down, you can:') +
+                        '\n\n- ' +
+                        _('Select a range of cells in the sheet, then ask your question again') +
+                        '\n- ' +
+                        _('Reply with a range to focus on, like `A1:D100`'));
+                case 'deckReady': {
+                    let msg = AIChatSidebar.interpolate(_('Your deck is ready: {0} slides built from the approved outline.'), args);
+                    if (Number(args[1]) > 0)
+                        msg +=
+                            ' ' +
+                                AIChatSidebar.interpolate(_('{0} slide(s) could not be built and were skipped.'), [args[1]]);
+                    if (Number(args[2]) > 0)
+                        msg +=
+                            ' ' +
+                                AIChatSidebar.interpolate(_('{0} image(s) could not be generated and show a placeholder.'), [args[2]]);
+                    return msg;
+                }
+                default:
+                    return data.displayContent || undefined;
+            }
+        }
+        startRequestTimeout(requestId, ms, handler) {
+            setTimeout(() => {
+                if (!this.isProcessing || this.currentRequestId !== requestId)
+                    return;
+                // The user is deliberating over a card; give them another full
+                // window instead of timing the request out under them.
+                if (this.awaitingUserDecision) {
+                    this.startRequestTimeout(requestId, ms, handler);
+                    return;
+                }
+                handler({
+                    success: false,
+                    error: this.timeoutErrorMessage,
+                    requestId: requestId,
+                });
+            }, ms);
+        }
+        // In a spreadsheet the cell under the cursor counts as the selection
+        // when no range is selected. The formula bar text of a formula cell
+        // starts with "=", or with "{=" for an array formula.
+        cursorCellHasFormula() {
+            if (app.map.getDocType() !== 'spreadsheet')
+                return false;
+            const content = app.map._docLayer?._lastFormula;
+            return !!content && (content.startsWith('=') || content.startsWith('{='));
+        }
+        hasSelectionToSend() {
+            return TextSelections.isActive() || this.cursorCellHasFormula();
+        }
+        async buildUserMessage(text) {
+            let selectedText = '';
+            if (this.hasSelectionToSend()) {
+                try {
+                    selectedText = await this.fetchSelectedMarkdown();
+                }
+                catch (e) {
+                    if (e?.message === 'complexselection') {
+                        this.hintText = _('The selection contains images or other non-text content that cannot be sent as context.');
+                        this.updateHint();
+                        return null;
+                    }
+                }
+                if (selectedText && selectedText === this.lastSentSelectedText) {
+                    selectedText = '';
+                }
+                if (selectedText) {
+                    this.lastSentSelectedText = selectedText;
+                }
+            }
+            let userContent = text;
+            // If createFormula() captured selection context before the user typed,
+            // use it when no fresh selection is available.
+            if (!selectedText && this.pendingFormulaContext) {
+                selectedText = '';
+                userContent = this.pendingFormulaContext + text;
+                this.pendingFormulaContext = '';
+            }
+            else if (selectedText) {
+                this.pendingFormulaContext = '';
+                userContent =
+                    '[Selected text from document:\n```\n' + selectedText + '\n```]\n\n';
+                if (app.map.getDocType() === 'spreadsheet') {
+                    userContent += this.getCellReferenceInstructions() + '\n\n';
+                }
+                userContent += text;
+            }
+            return {
+                role: 'user',
+                content: userContent,
+                displayContent: text,
+                selectedText: selectedText || undefined,
+                timestamp: Date.now(),
+            };
+        }
+        buildApiMessages() {
+            const apiMessages = [];
+            const textMessages = this.messages.filter((m) => !m.imageData &&
+                !m.isError &&
+                !m.isApproval &&
+                !m.isOutline &&
+                !m.withheld);
+            const recent = textMessages.slice(-this.MAX_API_MESSAGES);
+            for (const msg of recent) {
+                apiMessages.push({ role: msg.role, content: msg.content });
+            }
+            return apiMessages;
+        }
+        dispatchRequest() {
+            this.currentRequestId = this.generateRequestId();
+            this.awaitingUserDecision = false;
+            const isPreset = this.selectedTone !== null &&
+                this.TONE_PRESETS.some((p) => p.id === this.selectedTone);
+            const customTone = this.selectedTone && !isPreset
+                ? this.findCustomTone(this.selectedTone)
+                : undefined;
+            const payload = JSON.stringify({
+                messages: this.buildApiMessages(),
+                requestId: this.currentRequestId,
+                docType: app.map.getDocType(),
+                tone: customTone ? 'custom' : this.selectedTone,
+                customToneDescription: customTone ? customTone.description : undefined,
+                emojify: this.emojify,
+                designTemplate: this.designTemplate || undefined,
+            });
+            app.socket.sendMessage('aichat: ' + payload);
+            this.startRequestTimeout(this.currentRequestId, this.requestTimeoutMs, (d) => this.onAIChatResult(d));
+        }
+        // A caller-supplied prompt leaves the user's own draft in the input.
+        async sendMessage(prompt) {
+            const text = (prompt ?? this.inputText).trim();
+            if (!text || this.isProcessing)
+                return;
+            if (text.length > this.MAX_MESSAGE_LENGTH) {
+                this.hintText = _('Message is too long. Please shorten it and try again.');
+                this.updateHint();
+                return;
+            }
+            if (this.tonePickerOpen) {
+                this.tonePickerOpen = false;
+            }
+            this.dropPendingDiagnosis();
+            this.hintText = '';
+            if (prompt === undefined) {
+                this.inputText = '';
+                // Clear the DOM value synchronously so that a pending keyup
+                // event does not restore inputText from the stale DOM value.
+                const textarea = document.querySelector('#aichat-input.ui-textarea');
+                if (textarea)
+                    textarea.value = '';
+            }
+            const userMsg = await this.buildUserMessage(text);
+            if (!userMsg)
+                return;
+            this.messages.push(userMsg);
+            this.isProcessing = true;
+            if (this.messages.length === 1) {
+                // First message - full rebuild to transition from prompt cards
+                this.updateChatState(true);
+            }
+            else {
+                this.appendMessage(userMsg, this.messages.length - 1);
+                this.updateLoadingDots();
+                this.updateInputArea();
+                this.updateHeader();
+            }
+            this.updateHint();
+            this.dispatchRequest();
+        }
+        handleAIResponse(data, buildSuccessMsg, defaultError) {
+            if (data.requestId !== this.currentRequestId)
+                return;
+            this.isProcessing = false;
+            this.awaitingUserDecision = false;
+            this.hintText = '';
+            this.progressText = '';
+            if (data.success) {
+                this.messages.push(buildSuccessMsg(data));
+            }
+            else {
+                const errorText = this.translateChatError(data, defaultError);
+                this.messages.push({
+                    role: 'assistant',
+                    content: _('Error: ') + errorText,
+                    timestamp: Date.now(),
+                    isError: true,
+                });
+            }
+            this.updateLoadingDots();
+            const replyIndex = this.messages.length - 1;
+            this.appendMessage(this.messages[replyIndex], replyIndex);
+            this.updateInputArea();
+            this.updateHeader();
+            if (data.success &&
+                this.pendingChoices &&
+                this.pendingChoices.requestId === data.requestId) {
+                const choices = this.pendingChoices;
+                this.pendingChoices = null;
+                this.decorateMessageWithChoices(replyIndex, choices);
+            }
+        }
+        onAIChatResult(data) {
+            this.handleAIResponse(data, (d) => {
+                if (d.imageData) {
+                    return {
+                        role: 'assistant',
+                        content: _('Generated image'),
+                        imageData: d.imageData,
+                        timestamp: Date.now(),
+                    };
+                }
+                return {
+                    role: 'assistant',
+                    content: d.content,
+                    displayContent: this.translateDisplay(d),
+                    timestamp: Date.now(),
+                };
+            }, _('AI request failed'));
+        }
+        onAIChatProgress(data) {
+            if (data.requestId !== this.currentRequestId)
+                return;
+            this.progressText = this.translateProgress(data);
+            this.updateLoadingDots();
+            // Reset the request timeout so multi-round loops do not time out
+            this.startRequestTimeout(this.currentRequestId, this.requestTimeoutMs, (d) => this.onAIChatResult(d));
+        }
+        getModelDisplayName() {
+            return app.map.aiModelName || _('The AI assistant');
+        }
+        // Builds a short, deterministic description of what a slide transform
+        // does, counted from the commands themselves. Returns null when the
+        // payload has no slide commands to count (other document types, or a
+        // payload that does not parse).
+        describeTransform(transformJson) {
+            if (!transformJson)
+                return null;
+            let cmds;
+            try {
+                const obj = JSON.parse(transformJson);
+                cmds = obj && obj.Transforms && obj.Transforms.SlideCommands;
+            }
+            catch (e) {
+                return null;
+            }
+            if (!Array.isArray(cmds) || !cmds.length)
+                return null;
+            const counts = {};
+            let template = null;
+            for (const cmd of cmds) {
+                if (!cmd || typeof cmd !== 'object')
+                    continue;
+                for (const key of Object.keys(cmd)) {
+                    const base = key.split('.')[0];
+                    if (base === 'ApplyTemplate' && typeof cmd[key] === 'string') {
+                        template = cmd[key];
+                    }
+                    counts[base] = (counts[base] || 0) + 1;
+                }
+            }
+            const parts = [];
+            const inserts = (counts['InsertMasterSlide'] || 0) +
+                (counts['InsertMasterSlideByName'] || 0);
+            if (inserts)
+                parts.push(_n('insert %n slide', 'insert %n slides', inserts));
+            if (counts['DeleteSlide'])
+                parts.push(_n('delete %n slide', 'delete %n slides', counts['DeleteSlide']));
+            if (counts['DuplicateSlide'])
+                parts.push(_n('duplicate %n slide', 'duplicate %n slides', counts['DuplicateSlide']));
+            if (counts['MoveSlide'])
+                parts.push(_n('move %n slide', 'move %n slides', counts['MoveSlide']));
+            if (counts['RenameSlide'])
+                parts.push(_n('rename %n slide', 'rename %n slides', counts['RenameSlide']));
+            const layouts = (counts['ChangeLayout'] || 0) + (counts['ChangeLayoutByName'] || 0);
+            if (layouts)
+                parts.push(_n('change %n layout', 'change %n layouts', layouts));
+            if (counts['SetText'])
+                parts.push(_n('set text in %n place', 'set text in %n places', counts['SetText']));
+            if (counts['EditTextObject'])
+                parts.push(_n('format text in %n place', 'format text in %n places', counts['EditTextObject']));
+            if (counts['GenerateImage'])
+                parts.push(_n('generate %n image', 'generate %n images', counts['GenerateImage']));
+            if (counts['UnoCommand'])
+                parts.push(_n('run %n document command', 'run %n document commands', counts['UnoCommand']));
+            const described = [
+                'InsertMasterSlide',
+                'InsertMasterSlideByName',
+                'DeleteSlide',
+                'DuplicateSlide',
+                'MoveSlide',
+                'RenameSlide',
+                'ChangeLayout',
+                'ChangeLayoutByName',
+                'SetText',
+                'EditTextObject',
+                'GenerateImage',
+                'UnoCommand',
+                'ApplyTemplate',
+                // Navigation and selection do not change the document, so
+                // the badge leaves them out on purpose.
+                'JumpToSlide',
+                'JumpToSlideByName',
+                'MarkObject',
+                'UnMarkObject',
+            ];
+            for (const base of Object.keys(counts)) {
+                if (described.indexOf(base) >= 0)
+                    continue;
+                // A command these descriptions do not know is reported by its
+                // raw name, so the badge cannot under-describe the change.
+                parts.push(_n('run %n %1 command', 'run %n %1 commands', counts[base]).replace('%1', base));
+            }
+            if (template)
+                parts.push(_("apply the design template '%1'").replace('%1', template));
+            if (!parts.length)
+                return null;
+            return _('This will: %1.').replace('%1', parts.join(', '));
+        }
+        onAIChatApproval(data) {
+            if (data.requestId !== this.currentRequestId)
+                return;
+            this.awaitingUserDecision = true;
+            this.hintText = '';
+            this.updateHint();
+            const name = this.getModelDisplayName();
+            let content;
+            if (data.toolName === 'extract_document_structure') {
+                const plan = data.summary;
+                if (plan) {
+                    content = plan + '\n\n' + _('Do you want to proceed?');
+                }
+                else {
+                    content = _('%1 wants to inspect your document. Do you want to proceed?').replace('%1', name);
+                }
+            }
+            else if (data.toolName === 'transform_document_structure') {
+                const summary = data.summary || _('Modify document structure');
+                // The summary above is the model's own description of the
+                // change; the badge below is counted from the commands that
+                // will actually run, so the card cannot under-describe them.
+                const badge = this.describeTransform(data.transformJson);
+                content =
+                    _('%1 wants to modify your document:').replace('%1', name) +
+                        '\n\n' +
+                        summary +
+                        (badge ? '\n\n' + badge : '') +
+                        '\n\n' +
+                        _('Do you want to apply this change?');
+            }
+            else if (data.toolName === 'set_cell_formula') {
+                const summary = data.summary || _('Set cell formula');
+                content =
+                    _('%1 wants to set a formula in your spreadsheet:').replace('%1', name) +
+                        '\n\n' +
+                        summary +
+                        '\n\n' +
+                        _('Do you want to apply this change?');
+            }
+            else {
+                content = _('%1 wants to perform an action. Do you want to proceed?').replace('%1', name);
+            }
+            // Show the approval UI as an assistant message
+            const approvalMsg = {
+                role: 'assistant',
+                content: content,
+                timestamp: Date.now(),
+                isApproval: true,
+                approvalType: data.toolName === 'transform_document_structure' ||
+                    data.toolName === 'set_cell_formula'
+                    ? 'modify'
+                    : 'inspect',
+            };
+            this.messages.push(approvalMsg);
+            this.appendMessage(approvalMsg, this.messages.length - 1);
+        }
+        // The approve and reject buttons for a pending approval message. They are
+        // built from the message's own state on every render, so they come back
+        // after the messages area is rebuilt.
+        buildApprovalButtons() {
+            const btnContainer = document.createElement('div');
+            btnContainer.className = 'aichat-approval-buttons';
+            const approveBtn = document.createElement('button');
+            approveBtn.textContent = _('Approve');
+            approveBtn.className = 'aichat-approve-btn';
+            approveBtn.setAttribute('aria-label', _('Approve action'));
+            approveBtn.onclick = () => this.sendApprovalAction('approve');
+            const rejectBtn = document.createElement('button');
+            rejectBtn.textContent = _('Reject');
+            rejectBtn.className = 'aichat-reject-btn';
+            rejectBtn.setAttribute('aria-label', _('Reject action'));
+            rejectBtn.onclick = () => this.sendApprovalAction('reject');
+            btnContainer.appendChild(approveBtn);
+            btnContainer.appendChild(rejectBtn);
+            return btnContainer;
+        }
+        // The send and cancel buttons for a pending formula diagnosis. They look
+        // like the approval buttons, and nothing leaves the sidebar until the
+        // user presses send.
+        buildDiagnosisButtons() {
+            const btnContainer = document.createElement('div');
+            btnContainer.className = 'aichat-approval-buttons';
+            const sendBtn = document.createElement('button');
+            sendBtn.textContent = _('Send');
+            sendBtn.className = 'aichat-approve-btn';
+            sendBtn.setAttribute('aria-label', _('Send these cells'));
+            sendBtn.onclick = () => this.decideDiagnosis(true);
+            const cancelBtn = document.createElement('button');
+            cancelBtn.textContent = _('Cancel');
+            cancelBtn.className = 'aichat-reject-btn';
+            cancelBtn.setAttribute('aria-label', _('Do not send these cells'));
+            cancelBtn.onclick = () => this.decideDiagnosis(false);
+            btnContainer.appendChild(sendBtn);
+            btnContainer.appendChild(cancelBtn);
+            return btnContainer;
+        }
+        decideDiagnosis(send) {
+            const pending = this.pendingDiagnosis;
+            if (!pending)
+                return;
+            this.pendingDiagnosis = null;
+            this.markApprovalDecided(pending.card);
+            if (send) {
+                pending.request.withheld = false;
+                this.startDiagnosisRequest();
+            }
+            else {
+                this.hintText = _('Nothing was sent.');
+                this.updateHint();
+            }
+        }
+        // Withdraws a diagnosis that is still waiting for the user, so its card
+        // no longer offers to send it.
+        dropPendingDiagnosis() {
+            if (!this.pendingDiagnosis)
+                return;
+            this.markApprovalDecided(this.pendingDiagnosis.card);
+            this.pendingDiagnosis = null;
+        }
+        sendApprovalAction(action) {
+            this.awaitingUserDecision = false;
+            this.markApprovalDecided();
+            const body = {
+                requestId: this.currentRequestId,
+                action: action,
+            };
+            const payload = JSON.stringify(body);
+            app.socket.sendMessage('aichatapprove: ' + payload);
+            if (action === 'approve') {
+                this.progressText = _('Applying changes...');
+                this.updateLoadingDots();
+            }
+            else {
+                this.hintText = _('Change rejected');
+                this.updateHint();
+            }
+            if (action === 'approve') {
+                // Reset timeout for the remaining loop
+                this.startRequestTimeout(this.currentRequestId, this.requestTimeoutMs, (d) => this.onAIChatResult(d));
+            }
+        }
+        // Records the decision on an approval and removes its buttons, so the
+        // transcript keeps the message without offering the decision a second
+        // time. Without a target, the approval is the newest one still awaiting
+        // a decision.
+        markApprovalDecided(target) {
+            for (let i = this.messages.length - 1; i >= 0; i--) {
+                const msg = this.messages[i];
+                if (target ? msg !== target : msg.decided || !msg.isApproval)
+                    continue;
+                msg.decided = true;
+                const el = document.getElementById('aichat-msg-' + i);
+                const buttons = el
+                    ? el.querySelector('.aichat-approval-buttons')
+                    : null;
+                if (buttons)
+                    buttons.remove();
+                return;
+            }
+        }
+        onAIChatChoices(data) {
+            if (!data || data.requestId !== this.currentRequestId)
+                return;
+            if (!Array.isArray(data.choices) || data.choices.length === 0)
+                return;
+            this.pendingChoices = data;
+        }
+        decorateMessageWithChoices(index, payload) {
+            app.layoutingService.onDrain(() => {
+                const msgBody = document.getElementById('aichat-msg-text-' + index);
+                if (!msgBody)
+                    return;
+                // Strip leading section numbers ("1.", "1.1.", "1.1.1") and
+                // surrounding whitespace, then case-fold, so that the model's
+                // "1. Introduction" matches the canonical "1.Introduction" the
+                // document gave us.
+                const normalize = (s) => s
+                    .trim()
+                    .replace(/^\d+(\.\d+)*\.?\s*/, '')
+                    .toLowerCase()
+                    .replace(/\s+/g, ' ');
+                const byNormalized = {};
+                for (const c of payload.choices) {
+                    byNormalized[normalize(c.label)] = c;
+                }
+                // Each heading shown in the model's prose lands as the leaf text
+                // of an <li> (or, rarely, a <p>). Walk those and, when their
+                // non-list text matches a known choice, wrap that text in a
+                // clickable anchor. Nested sublists stay outside the anchor so
+                // only the heading itself is the click target.
+                const candidates = msgBody.querySelectorAll('li, p');
+                candidates.forEach((item) => {
+                    const clone = item.cloneNode(true);
+                    clone.querySelectorAll('ul, ol').forEach((n) => n.remove());
+                    const text = (clone.textContent || '').trim();
+                    if (!text)
+                        return;
+                    const choice = byNormalized[normalize(text)];
+                    if (!choice)
+                        return;
+                    const link = document.createElement('a');
+                    link.className = 'aichat-choice-link';
+                    link.setAttribute('role', 'button');
+                    link.setAttribute('tabindex', '0');
+                    link.setAttribute('aria-label', choice.label);
+                    const activate = (e) => {
+                        e.preventDefault();
+                        this.sendChoiceAsUserMessage(choice);
+                    };
+                    link.onclick = activate;
+                    link.onkeydown = (e) => {
+                        if (e.key === 'Enter' || e.key === ' ')
+                            activate(e);
+                    };
+                    const movable = Array.from(item.childNodes).filter((n) => {
+                        if (n.nodeType === Node.ELEMENT_NODE) {
+                            const tag = n.tagName;
+                            return tag !== 'UL' && tag !== 'OL';
+                        }
+                        return true;
+                    });
+                    for (const child of movable)
+                        link.appendChild(child);
+                    item.insertBefore(link, item.firstChild);
+                });
+            });
+        }
+        sendChoiceAsUserMessage(choice) {
+            if (this.isProcessing)
+                return;
+            this.sendMessage(_('Use section: ') + choice.label).catch((e) => {
+                window.console.error('Sending the section choice failed:', e);
+            });
+        }
+        clearConversation() {
+            this.messages = [];
+            this.isProcessing = false;
+            this.currentRequestId = '';
+            this.inputText = '';
+            this.lastSentSelectedText = '';
+            this.hintText = '';
+            this.progressText = '';
+            this.showAllCards = false;
+            this.formOpen = false;
+            this.formDraft = null;
+            this.emojiPickerOpen = false;
+            this.deleteConfirmOpen = false;
+            this.pendingChoices = null;
+            this.pendingDiagnosis = null;
+            this.designTemplate = null;
+            this.render();
+        }
+        async fetchSelectedMarkdown() {
+            // Use annotated markdown for Calc to include row/column
+            // headers that give the LLM cell-address context.
+            const isCalc = app.map.getDocType() === 'spreadsheet';
+            const mimeType = isCalc
+                ? 'application/x-libreoffice-markdown-annotated'
+                : 'text/markdown;charset=utf-8';
+            return new Promise((resolve, reject) => {
+                const cleanup = () => {
+                    clearTimeout(timeout);
+                    app.map.off('textselectioncontent', handleTextResponse);
+                    app.map.off('complexselection', handleComplexResponse);
+                };
+                const timeout = setTimeout(() => {
+                    cleanup();
+                    reject(new Error(_('Selection fetch timeout')));
+                }, this.SELECTION_FETCH_TIMEOUT_MS);
+                const handleTextResponse = (e) => {
+                    const textMsg = e.msg || '';
+                    if (textMsg.startsWith('textselectioncontent:')) {
+                        cleanup();
+                        const content = textMsg.substring('textselectioncontent:'.length);
+                        try {
+                            // If multiple MIME types, it comes as JSON
+                            if (content.startsWith('{')) {
+                                const json = JSON.parse(content);
+                                const markdown = json[mimeType] || '';
+                                resolve(markdown);
+                            }
+                            else {
+                                resolve(content);
+                            }
+                        }
+                        catch {
+                            reject(new Error(_('Failed to parse selection content')));
+                        }
+                    }
+                };
+                const handleComplexResponse = () => {
+                    cleanup();
+                    reject(new Error('complexselection'));
+                };
+                app.map.on('textselectioncontent', handleTextResponse);
+                app.map.on('complexselection', handleComplexResponse);
+                app.socket.sendMessage('gettextselection mimetype=' + mimeType);
+            });
+        }
+        insertAtCursor(markdownText) {
+            // Same paste mechanism - pastes at current cursor position.
+            const cleaned = this.stripCodeFences(markdownText);
+            const header = 'paste mimetype=text/markdown;charset=utf-8\n';
+            if (window.ThisIsAMobileApp) {
+                // The app builds talk to the native side over a string-only bridge
+                // that cannot carry a binary payload, so base64-encode it. The kit's
+                // ChildSession::paste decodes it. Mirrors L.Clipboard._pasteTypedBlob
+                // in browser/src/map/Clipboard.js.
+                const utf8 = new TextEncoder().encode(cleaned);
+                const b64 = window.btoa(Array.from(utf8, (b) => String.fromCodePoint(b)).join(''));
+                app.socket.sendMessage(header + b64);
+            }
+            else {
+                app.socket.sendMessage(new Blob([header, cleaned]));
+            }
+            app.map.fire('editorgotfocus');
+            app.map.focus();
+        }
+        base64ToUint8Array(data) {
+            const byteChars = atob(data);
+            const bytes = new Uint8Array(byteChars.length);
+            for (let i = 0; i < byteChars.length; i++) {
+                bytes[i] = byteChars.charCodeAt(i);
+            }
+            return bytes;
+        }
+        insertImageAtCursor(base64Data) {
+            const header = 'paste mimetype=image/png\n';
+            if (window.ThisIsAMobileApp) {
+                // The kit base64-decodes on the app builds, and the image is already
+                // base64.
+                app.socket.sendMessage(header + base64Data);
+            }
+            else {
+                const bytes = this.base64ToUint8Array(base64Data);
+                app.socket.sendMessage(new Blob([header, bytes.buffer]));
+            }
+            app.map.fire('editorgotfocus');
+            app.map.focus();
+        }
+        copyImageToClipboard(base64Data, index) {
+            const imgBlob = new Blob([this.base64ToUint8Array(base64Data)], {
+                type: 'image/png',
+            });
+            if (navigator.clipboard && navigator.clipboard.write) {
+                navigator.clipboard
+                    .write([
+                    new ClipboardItem({
+                        'image/png': Promise.resolve(imgBlob),
+                    }),
+                ])
+                    .then(() => {
+                    this.showCopyFeedback(index, 'aichat-copy-img-');
+                })
+                    .catch((e) => {
+                    window.console.error('Copy image failed:', e);
+                });
+            }
+            else {
+                window.console.error('Clipboard API not available');
+            }
+        }
+        attachContainerKeyboardHandler() {
+            if (this._keyboardHandlerAttached)
+                return;
+            this._keyboardHandlerAttached = true;
+            this.container.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    if (this.deleteConfirmOpen) {
+                        this.closeDeleteConfirm();
+                    }
+                    else if (this.emojiPickerOpen) {
+                        this.closeEmojiPicker();
+                    }
+                    else if (this.formOpen) {
+                        this.closeToneForm();
+                    }
+                    else if (this.tonePickerOpen) {
+                        this.closeTonePicker();
+                    }
+                    else {
+                        this.hide();
+                    }
+                    return;
+                }
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    const target = e.target;
+                    if (target &&
+                        target.classList.contains('ui-textarea') &&
+                        target.closest('#aichat-input')) {
+                        e.preventDefault();
+                        this.sendMessage();
+                    }
+                }
+            });
+        }
+        showCopyFeedback(index, prefix = 'aichat-copy-text-') {
+            const wrapper = document.getElementById(prefix + index);
+            if (!wrapper)
+                return;
+            const img = wrapper.querySelector('button img');
+            if (!img)
+                return;
+            const originalSrc = img.src;
+            img.src = this.ICON_CHECK;
+            setTimeout(function () {
+                if (img.isConnected) {
+                    img.src = originalSrc;
+                }
+            }, this.COPY_FEEDBACK_DURATION_MS);
+        }
+        showTransientHint(text) {
+            this.hintText = text;
+            this.updateHint();
+            setTimeout(() => {
+                if (this.hintText === text) {
+                    this.hintText = '';
+                    this.updateHint();
+                }
+            }, this.COPY_FEEDBACK_DURATION_MS);
+        }
+        copyToClipboard(text, index) {
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard
+                    .writeText(text)
+                    .then(() => {
+                    this.showCopyFeedback(index);
+                })
+                    .catch(() => {
+                    this.fallbackCopy(text, index);
+                });
+            }
+            else {
+                this.fallbackCopy(text, index);
+            }
+        }
+        fallbackCopy(text, index) {
+            const textArea = document.createElement('textarea');
+            textArea.style.position = 'absolute';
+            textArea.style.opacity = '0';
+            textArea.value = text;
+            document.body.appendChild(textArea);
+            textArea.select();
+            try {
+                document.execCommand('copy');
+                this.showCopyFeedback(index);
+            }
+            catch (e) {
+                window.console.error('Copy failed:', e);
+            }
+            finally {
+                document.body.removeChild(textArea);
+            }
+        }
+        markdownToHtml(text) {
+            let html;
+            if (typeof marked !== 'undefined') {
+                html = marked.parse(text.trim(), {
+                    gfm: true,
+                    breaks: true,
+                });
+            }
+            else {
+                // Fallback: plain text with basic escaping and line breaks
+                html =
+                    '<p>' +
+                        text
+                            .replace(/&/g, '&amp;')
+                            .replace(/</g, '&lt;')
+                            .replace(/>/g, '&gt;')
+                            .replace(/\n/g, '<br>') +
+                        '</p>';
+            }
+            // Convert cell links to clickable spans before sanitization. marked
+            // turns [A1](cell://A1) into <a href="cell://A1">A1</a>. The target can
+            // also be a range or a cell on another sheet, such as Budget.A5:B10,
+            // with or without the cell:// prefix.
+            html = html.replace(/<a\s+href="(cell:\/\/)?([^"]*)"[^>]*>((?:(?!<\/a>)[\s\S])*)<\/a>/gi, (link, prefix, target, label) => {
+                const reference = this.cellReference(target);
+                if (!reference)
+                    return prefix ? label : link;
+                return ('<span class="aichat-cell-ref" data-cell="' +
+                    app.LOUtil.escapeHtml(reference).replace(/"/g, '&quot;') +
+                    '" role="link" tabindex="0">' +
+                    label +
+                    '</span>');
+            });
+            // Autolink bare URLs. A cell reference such as Budget.A5:B10 reads as a
+            // URL whose scheme is "Budget.A5", so a URL with a scheme is linked only
+            // when the scheme is one for the web or for mail.
+            if (typeof Autolinker !== 'undefined') {
+                html = Autolinker.link(html, {
+                    replaceFn: (match) => match.getType() !== 'url' ||
+                        match.getUrlMatchType() !== 'scheme' ||
+                        /^(https?|ftp|mailto):/i.test(match.getUrl()),
+                });
+            }
+            return html;
+        }
+        // The cell or range a link target names, or null when it names neither.
+        // marked percent-encodes the target, so it is decoded first. A sheet is
+        // quoted when its name needs it, and is followed by a period or an
+        // exclamation mark.
+        cellReference(target) {
+            let reference;
+            try {
+                reference = decodeURIComponent(target);
+            }
+            catch {
+                return null;
+            }
+            const sheet = "(?:\\$?(?:'(?:[^']|'')+'|[^\\s'\"!.:<>]+)[.!])?";
+            const cell = '\\$?[A-Za-z]{1,3}\\$?\\d{1,7}';
+            const pattern = new RegExp('^' + sheet + cell + '(?::' + sheet + cell + ')?$');
+            return pattern.test(reference) ? reference : null;
+        }
+        findPrecedingUserMessage(assistantMsgIndex) {
+            for (let i = assistantMsgIndex - 1; i >= 0; i--) {
+                if (this.messages[i].role === 'user') {
+                    return this.messages[i];
+                }
+            }
+            return null;
+        }
+        stripCodeFences(text) {
+            // Strip markdown code fences that AI models often wrap responses in
+            // Handles: ```markdown\n...\n``` and ```\n...\n```
+            let result = text.trim();
+            const fencePattern = /^```(?:markdown|md)?\s*\n([\s\S]*?)\n```\s*$/;
+            const match = result.match(fencePattern);
+            if (match) {
+                result = match[1];
+            }
+            return result;
+        }
+        // Fetches the design-template catalog (each entry a name and a thumbnail
+        // data URL) from core through the generic commandvalues channel. Resolves
+        // to an empty array on timeout or error so generation can still proceed.
+        fetchDesignTemplates() {
+            return new Promise((resolve) => {
+                const timeout = setTimeout(() => {
+                    app.map.off('commandvalues', handleResponse);
+                    resolve([]);
+                }, this.TEMPLATE_FETCH_TIMEOUT_MS);
+                const handleResponse = (e) => {
+                    if (e.commandName !== '.uno:GetDesignTemplates')
+                        return;
+                    clearTimeout(timeout);
+                    app.map.off('commandvalues', handleResponse);
+                    const templates = e.commandValues && Array.isArray(e.commandValues.templates)
+                        ? e.commandValues.templates
+                        : [];
+                    resolve(templates);
+                };
+                app.map.on('commandvalues', handleResponse);
+                app.socket.sendMessage('commandvalues command=.uno:GetDesignTemplates');
+            });
+        }
+        // Appends the design picker to a deck decision card: a "No design" chip
+        // plus one card per catalog template. The pick is held in the card's
+        // state, so a rebuilt picker shows the chip the user chose, and it stays
+        // null while the plain option stands.
+        appendDesignPicker(container, state) {
+            const section = document.createElement('div');
+            section.className = 'aichat-design-section';
+            const label = document.createElement('div');
+            label.className = 'aichat-design-label';
+            label.textContent = _('Design (optional):');
+            section.appendChild(label);
+            const grid = document.createElement('div');
+            grid.className = 'aichat-template-picker';
+            section.appendChild(grid);
+            const select = (btn, name) => {
+                state.design = name;
+                grid
+                    .querySelectorAll('button')
+                    .forEach((b) => b.setAttribute('aria-pressed', 'false'));
+                btn.setAttribute('aria-pressed', 'true');
+            };
+            const none = document.createElement('button');
+            none.className = 'aichat-template-skip';
+            none.textContent = _('No design');
+            none.setAttribute('aria-label', _('Continue without a design template'));
+            none.setAttribute('aria-pressed', state.design === null ? 'true' : 'false');
+            none.onclick = () => select(none, null);
+            grid.appendChild(none);
+            const catalog = this.templateCatalogPromise || this.fetchDesignTemplates();
+            this.templateCatalogPromise = catalog;
+            catalog.then((templates) => {
+                for (const tpl of templates) {
+                    if (!tpl || !tpl.name)
+                        continue;
+                    const card = document.createElement('button');
+                    card.className = 'aichat-template-card';
+                    card.title = tpl.name;
+                    card.setAttribute('aria-label', tpl.name);
+                    card.setAttribute('aria-pressed', state.design === tpl.name ? 'true' : 'false');
+                    if (tpl.thumbnail) {
+                        const img = document.createElement('img');
+                        img.className = 'aichat-template-thumb';
+                        img.src = tpl.thumbnail;
+                        img.alt = tpl.name;
+                        card.appendChild(img);
+                    }
+                    const name = document.createElement('span');
+                    name.className = 'aichat-template-name';
+                    name.textContent = tpl.name;
+                    card.appendChild(name);
+                    const chosen = tpl.name;
+                    card.onclick = () => select(card, chosen);
+                    grid.insertBefore(card, none);
+                }
+            });
+            container.appendChild(section);
+        }
+        // Records the server-proposed deck outline on its chat message. The card
+        // itself is built from that state whenever the message is rendered, so
+        // the rows, the typed edits and the design pick survive a rebuild of the
+        // messages area. Only an aichatoutline: for the current request counts.
+        onAIChatOutline(data) {
+            if (!data || data.requestId !== this.currentRequestId)
+                return;
+            // The request timeout stays paused while the card is on screen, so
+            // the user can edit the outline for as long as they need.
+            this.awaitingUserDecision = true;
+            const proposed = Array.isArray(data.slides) ? data.slides : [];
+            const slides = proposed.map((slide) => this.makeOutlineCardSlide({
+                part: typeof slide?.part === 'string' ? slide.part : '',
+                intent: typeof slide?.intent === 'string' ? slide.intent : '',
+                title: typeof slide?.title === 'string' ? slide.title : '',
+                gist: typeof slide?.gist === 'string' ? slide.gist : '',
+            }));
+            const outlineMsg = {
+                role: 'assistant',
+                content: _('Here is a proposed outline. Edit the titles or descriptions, remove slides you do not want, then approve to build the deck:'),
+                timestamp: Date.now(),
+                isOutline: true,
+                outline: {
+                    title: typeof data.title === 'string' ? data.title : '',
+                    slides: slides,
+                    design: null,
+                    // An outline always builds a deck, so a conversation with no
+                    // recorded pick offers the design catalog on the card and the
+                    // pick rides the approval.
+                    offerDesign: this.designTemplate === null,
+                },
+            };
+            this.messages.push(outlineMsg);
+            this.appendMessage(outlineMsg, this.messages.length - 1);
+        }
+        // One outline row, with the proposed title and description kept beside
+        // the editable ones.
+        makeOutlineCardSlide(slide) {
+            return {
+                part: slide.part,
+                intent: slide.intent,
+                title: slide.title,
+                gist: slide.gist,
+                proposedTitle: slide.title,
+                proposedGist: slide.gist,
+            };
+        }
+        // Auto-sizes a description textarea to the height of its content, so it
+        // grows from a single line without a fixed tall box. A textarea can only
+        // measure its content once it is in the document.
+        growGist(gist) {
+            gist.style.height = 'auto';
+            gist.style.height = gist.scrollHeight + 'px';
+        }
+        // Builds the editable outline card from the state its message carries: one
+        // row per slide with an editable title and description, the part and
+        // intent as a muted eyebrow, and a delete button, plus the design picker,
+        // add-slide, and approve and reject. index names the message the decision
+        // is recorded on.
+        buildOutlineCard(state, index) {
+            const card = document.createElement('div');
+            card.className = 'aichat-outline-card';
+            // The strip leads the card so the look is chosen before the content
+            // is reviewed.
+            if (state.offerDesign)
+                this.appendDesignPicker(card, state);
+            const approveBtn = document.createElement('button');
+            approveBtn.className = 'aichat-approve-btn';
+            approveBtn.textContent = _('Approve');
+            const rejectBtn = document.createElement('button');
+            rejectBtn.className = 'aichat-reject-btn';
+            rejectBtn.textContent = _('Reject');
+            rejectBtn.setAttribute('aria-label', _('Reject outline'));
+            // A muted note under the buttons, shown only while approve is
+            // blocked because an added slide still has no title.
+            const hint = document.createElement('div');
+            hint.className = 'aichat-outline-hint';
+            hint.textContent = _('Give every added slide a title to approve.');
+            hint.style.display = 'none';
+            // Enable approve only when every row has a title to build from. A
+            // typed title always works, and an empty input falls back to the
+            // proposed title on approve, so only a row with neither - an added
+            // slide the user has not named yet - blocks approve.
+            const updateApproveState = () => {
+                const blocked = state.slides.length === 0 ||
+                    state.slides.some((slide) => !slide.title.trim() && !slide.proposedTitle.trim());
+                approveBtn.disabled = blocked;
+                hint.style.display = blocked && state.slides.length > 0 ? '' : 'none';
+            };
+            // Renumber the visible rows and their labels after a row is added or
+            // removed, then recheck whether approve is allowed.
+            const renumber = () => {
+                const rows = card.querySelectorAll('.aichat-outline-row');
+                rows.forEach((row, i) => {
+                    const numberLabel = row.querySelector('.aichat-outline-num');
+                    if (numberLabel)
+                        numberLabel.textContent = i + 1 + '.';
+                    const input = row.querySelector('.aichat-outline-title');
+                    if (input)
+                        input.setAttribute('aria-label', _('Slide %1 title').replace('%1', String(i + 1)));
+                    const gist = row.querySelector('.aichat-outline-gist');
+                    if (gist)
+                        gist.setAttribute('aria-label', _('Slide %1 description').replace('%1', String(i + 1)));
+                    const del = row.querySelector('.aichat-outline-delete');
+                    if (del)
+                        del.setAttribute('aria-label', _('Remove slide %1').replace('%1', String(i + 1)));
+                });
+                updateApproveState();
+            };
+            // Build one editable slide row. Both the server's proposed slides and
+            // a slide the user adds go through this, so the two are identical in
+            // structure and behaviour. Every edit is written straight back into
+            // the slide object the row shows.
+            const buildRow = (slide) => {
+                const part = slide.part;
+                const row = document.createElement('div');
+                row.className = 'aichat-outline-row';
+                if (part)
+                    row.classList.add('aichat-outline-part-' + part);
+                const header = document.createElement('div');
+                header.className = 'aichat-outline-header';
+                const numberLabel = document.createElement('span');
+                numberLabel.className = 'aichat-outline-num';
+                header.appendChild(numberLabel);
+                // The part and intent as a muted uppercase eyebrow, so the
+                // slide's role is named in text and not only by the edge colour.
+                const eyebrow = document.createElement('span');
+                eyebrow.className = 'aichat-outline-eyebrow';
+                eyebrow.textContent = part + ' - ' + slide.intent;
+                header.appendChild(eyebrow);
+                const deleteButton = document.createElement('button');
+                deleteButton.className = 'aichat-outline-delete';
+                deleteButton.textContent = '\u00D7';
+                deleteButton.onclick = () => {
+                    const at = state.slides.indexOf(slide);
+                    if (at >= 0)
+                        state.slides.splice(at, 1);
+                    row.remove();
+                    renumber();
+                };
+                header.appendChild(deleteButton);
+                row.appendChild(header);
+                const input = document.createElement('input');
+                input.type = 'text';
+                input.className = 'aichat-outline-title';
+                input.value = slide.title;
+                input.maxLength = 200;
+                input.placeholder = _('Slide title');
+                input.addEventListener('input', () => {
+                    slide.title = input.value;
+                    updateApproveState();
+                });
+                row.appendChild(input);
+                const gist = document.createElement('textarea');
+                gist.className = 'aichat-outline-gist';
+                gist.rows = 1;
+                gist.maxLength = 300;
+                gist.value = slide.gist;
+                gist.placeholder = _('What this slide should cover');
+                gist.addEventListener('input', () => {
+                    slide.gist = gist.value;
+                    this.growGist(gist);
+                });
+                row.appendChild(gist);
+                return row;
+            };
+            for (const slide of state.slides) {
+                card.appendChild(buildRow(slide));
+            }
+            // A ghost button at the end of the list adds a blank slide. New
+            // slides default to a body slide that uses bullet points, the common
+            // case; the user names it and can edit it like any other.
+            const addSlideButton = document.createElement('button');
+            addSlideButton.type = 'button';
+            addSlideButton.className = 'aichat-outline-add';
+            const addIcon = document.createElement('span');
+            addIcon.className = 'aichat-outline-add-icon';
+            addIcon.textContent = '+';
+            addIcon.setAttribute('aria-hidden', 'true');
+            addSlideButton.appendChild(addIcon);
+            addSlideButton.appendChild(document.createTextNode(_('Add slide')));
+            addSlideButton.onclick = () => {
+                const slide = this.makeOutlineCardSlide({
+                    part: 'body',
+                    intent: 'bullets',
+                    title: '',
+                    gist: '',
+                });
+                state.slides.push(slide);
+                const row = buildRow(slide);
+                card.insertBefore(row, addSlideButton);
+                renumber();
+                this.growGist(row.querySelector('.aichat-outline-gist'));
+                row.querySelector('.aichat-outline-title').focus();
+            };
+            card.appendChild(addSlideButton);
+            approveBtn.onclick = () => {
+                if (approveBtn.disabled)
+                    return;
+                const edited = state.slides.map((slide) => ({
+                    part: slide.part,
+                    intent: slide.intent,
+                    gist: slide.gist.trim() || slide.proposedGist,
+                    title: slide.title.trim() || slide.proposedTitle,
+                }));
+                const design = state.design;
+                if (design)
+                    this.designTemplate = design;
+                this.sendOutlineDecision('approve', { title: state.title, slides: edited }, design);
+                this.updateOutlineMessage(index, _('Outline approved - building %1 slides.').replace('%1', String(edited.length)));
+            };
+            rejectBtn.onclick = () => {
+                this.sendOutlineDecision('reject');
+                this.updateOutlineMessage(index, _('Outline rejected.'));
+            };
+            const buttons = document.createElement('div');
+            buttons.className = 'aichat-approval-buttons';
+            buttons.appendChild(approveBtn);
+            buttons.appendChild(rejectBtn);
+            card.appendChild(buttons);
+            card.appendChild(hint);
+            renumber();
+            return card;
+        }
+        // Sends the outline approve/reject decision. Approve carries the edited
+        // outline and the design pick made on the card, and, like a modify
+        // approval, arms the build progress and re-arms the request timeout.
+        // Reject sends the plain decision shape and leaves the request
+        // processing so the loop can continue.
+        sendOutlineDecision(action, outline, design) {
+            this.awaitingUserDecision = false;
+            const payload = {
+                requestId: this.currentRequestId,
+                action: action,
+            };
+            if (action === 'approve' && outline) {
+                payload.outline = outline;
+                if (design)
+                    payload.designTemplate = design;
+            }
+            app.socket.sendMessage('aichatapprove: ' + JSON.stringify(payload));
+            if (action === 'approve') {
+                this.progressText = _('Building slides...');
+                this.updateLoadingDots();
+                this.startRequestTimeout(this.currentRequestId, this.requestTimeoutMs, (d) => this.onAIChatResult(d));
+            }
+        }
+        // Replaces an outline card with the outcome text and removes the editable
+        // rows and buttons, so the transcript records the decision. The message
+        // keeps its outline for the record, and the decided flag is what stops
+        // the card being built again.
+        updateOutlineMessage(outlineIndex, text) {
+            const msg = this.messages[outlineIndex];
+            if (msg) {
+                msg.content = text;
+                msg.decided = true;
+            }
+            const msgEl = document.getElementById('aichat-msg-' + outlineIndex);
+            const card = msgEl ? msgEl.querySelector('.aichat-outline-card') : null;
+            if (card)
+                card.remove();
+            const msgBody = document.getElementById('aichat-msg-text-' + outlineIndex);
+            if (msgBody)
+                msgBody.textContent = text;
+        }
+        fetchFormulaDependencyChain() {
+            return new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => {
+                    app.map.off('commandvalues', handleResponse);
+                    reject(new Error(_('Formula analysis timeout')));
+                }, this.FORMULA_FETCH_TIMEOUT_MS);
+                const handleResponse = (e) => {
+                    if (e.commandName === '.uno:FormulaDepChain') {
+                        clearTimeout(timeout);
+                        app.map.off('commandvalues', handleResponse);
+                        resolve(e.commandValues);
+                    }
+                };
+                app.map.on('commandvalues', handleResponse);
+                app.socket.sendMessage('commandvalues command=.uno:FormulaDepChain');
+            });
+        }
+        // The prompt says nothing about what to rewrite - buildUserMessage()
+        // attaches the selection - so without one there is nothing to send.
+        runOnSelection(prompt) {
+            if (!this.isVisible())
+                this.show();
+            if (!this.hasSelectionToSend()) {
+                this.hintText = _('Select the content you want the assistant to work on first.');
+                this.updateHint();
+                return;
+            }
+            // Let the same selection through twice in a row, or the second
+            // action arrives with nothing to work on.
+            this.lastSentSelectedText = '';
+            this.sendMessage(prompt);
+        }
+        async diagnoseFormulaError() {
+            if (this.isProcessing)
+                return;
+            this.dropPendingDiagnosis();
+            this.progressText = _('Analyzing formula dependencies...');
+            this.updateMessagesArea();
+            let depChain;
+            try {
+                depChain = await this.fetchFormulaDependencyChain();
+            }
+            catch {
+                this.progressText = '';
+                this.hintText = _('Failed to analyze formula.');
+                this.updateHint();
+                return;
+            }
+            this.progressText = '';
+            this.hintText = '';
+            if (!depChain || !depChain.hasError) {
+                if (depChain && depChain.reason === 'not_formula') {
+                    this.hintText = _('The selected cell does not contain a formula.');
+                }
+                else {
+                    this.hintText = _('The selected cell does not have a formula error.');
+                }
+                this.updateHint();
+                return;
+            }
+            const content = this.buildFormulaDiagnosisPrompt(depChain);
+            const cell = depChain.cell;
+            const displayContent = _('Diagnose formula error in') +
+                ' ' +
+                cell.address +
+                ': ' +
+                cell.formula;
+            const cellList = this.listDependencyCells(depChain.dependencies || []);
+            // The formula alone is what the user asked about. The cells it reads
+            // go out only once the user has seen them listed and agreed, so until
+            // then the request stays in the chat without being sent.
+            const msg = {
+                role: 'user',
+                content: content,
+                displayContent: displayContent,
+                timestamp: Date.now(),
+                withheld: !!cellList,
+            };
+            this.inputText = '';
+            this.hintText = '';
+            this.messages.push(msg);
+            if (!cellList) {
+                this.startDiagnosisRequest();
+                return;
+            }
+            this.appendMessage(msg, this.messages.length - 1);
+            const card = {
+                role: 'assistant',
+                content: _('To diagnose the error in %1, these cells will be sent to %2:')
+                    .replace('%1', cell.address)
+                    .replace('%2', this.getModelDisplayName()) +
+                    '\n\n' +
+                    cellList +
+                    '\n\n' +
+                    _('Do you want to send them?'),
+                timestamp: Date.now(),
+                isApproval: true,
+                approvalType: 'inspect',
+                isDiagnosisConfirmation: true,
+            };
+            this.messages.push(card);
+            this.appendMessage(card, this.messages.length - 1);
+            this.pendingDiagnosis = { request: msg, card: card };
+        }
+        startDiagnosisRequest() {
+            this.isProcessing = true;
+            this.updateChatState(true);
+            this.updateHint();
+            this.dispatchRequest();
+        }
+        buildFormulaDiagnosisPrompt(depChain) {
+            const cell = depChain.cell;
+            let context = _('I have a formula error in my spreadsheet.') + '\n\n';
+            context +=
+                // TRANSLATORS: Sent to the AI model. {0} is a cell address such as
+                // TRANSLATORS: B5, {1} the name of its sheet
+                _('Cell {0} (Sheet: {1}) contains:')
+                    .replace('{0}', cell.address)
+                    .replace('{1}', cell.sheet) + '\n';
+            // The model writes formulas in the English grammar, so it reads them in that
+            // grammar too.
+            context += '  ' + _('Formula') + ': ' + cell.englishFormula + '\n';
+            context += '  ' + _('Error') + ': ' + cell.error + '\n\n';
+            if (depChain.dependencies && depChain.dependencies.length > 0) {
+                context += _('Referenced cells') + ':\n';
+                context += this.formatDependencies(depChain.dependencies, 1);
+                context += '\n';
+            }
+            context +=
+                // TRANSLATORS: Sent to the AI model. {0} is a Calc error code such
+                // TRANSLATORS: as #DIV/0!
+                _('Please diagnose why this formula produces the {0} error.').replace('{0}', cell.error) + ' ';
+            context += _('Explain the root cause and suggest how to fix it.');
+            context +=
+                ' ' +
+                    _('When referencing specific cells, format each cell address as a clickable link: [A1](cell://A1).');
+            return context;
+        }
+        // The cells of a dependency chain as a markdown list, one line per sheet
+        // such as "- Budget: A5, B6", followed by each summarized range and each
+        // reference to another file. Empty when the chain reads no cell.
+        listDependencyCells(deps) {
+            const cellsBySheet = new Map();
+            const others = [];
+            const collect = (list) => {
+                for (const dep of list) {
+                    if (dep.type === 'range') {
+                        others.push(dep.address + ' (' + _('only the cells with errors') + ')');
+                    }
+                    else if (dep.type === 'external') {
+                        others.push((dep.file || '') +
+                            (dep.sheet ? ' ' + dep.sheet : '') +
+                            ' (' +
+                            _('another file, its name only') +
+                            ')');
+                    }
+                    else if (dep.sheet && dep.address) {
+                        const cells = cellsBySheet.get(dep.sheet) || [];
+                        if (!cells.includes(dep.address))
+                            cells.push(dep.address);
+                        cellsBySheet.set(dep.sheet, cells);
+                    }
+                    if (dep.dependencies)
+                        collect(dep.dependencies);
+                }
+            };
+            collect(deps);
+            let result = '';
+            cellsBySheet.forEach((cells, sheet) => {
+                result += '- ' + sheet + ': ' + cells.join(', ') + '\n';
+            });
+            for (const other of others)
+                result += '- ' + other + '\n';
+            return result.trimEnd();
+        }
+        formatDependencies(deps, indent) {
+            let result = '';
+            let prefix = '';
+            for (let p = 0; p < indent; p++)
+                prefix += '  ';
+            for (let i = 0; i < deps.length; i++) {
+                const dep = deps[i];
+                if (dep.type === 'formula') {
+                    result += prefix + '- ' + dep.address + ': ';
+                    result += _('formula') + ' ' + dep.englishFormula;
+                    if (dep.error) {
+                        result += ' => ' + _('ERROR') + ': ' + dep.error;
+                    }
+                    else if (dep.value !== undefined) {
+                        result += ' => ' + dep.value;
+                    }
+                    result += '\n';
+                    if (dep.dependencies && dep.dependencies.length > 0) {
+                        result += this.formatDependencies(dep.dependencies, indent + 1);
+                    }
+                }
+                else if (dep.type === 'value') {
+                    result +=
+                        prefix +
+                            '- ' +
+                            dep.address +
+                            ': ' +
+                            _('value') +
+                            ' ' +
+                            dep.value +
+                            '\n';
+                }
+                else if (dep.type === 'string') {
+                    result +=
+                        prefix +
+                            '- ' +
+                            dep.address +
+                            ': ' +
+                            _('text') +
+                            ' "' +
+                            dep.value +
+                            '"\n';
+                }
+                else if (dep.type === 'empty') {
+                    result += prefix + '- ' + dep.address + ': (' + _('empty') + ')\n';
+                }
+                else if (dep.type === 'range') {
+                    result += prefix + '- ' + dep.address + ': ' + _('range');
+                    if (dep.errorCells) {
+                        result += ' (' + _('errors in') + ': ' + dep.errorCells + ')';
+                    }
+                    if (dep.scanLimited) {
+                        result += ' (' + _('only partially scanned') + ')';
+                    }
+                    result += '\n';
+                }
+                else if (dep.type === 'circular') {
+                    result +=
+                        prefix +
+                            '- ' +
+                            dep.address +
+                            ': (' +
+                            _('circular reference') +
+                            ')\n';
+                }
+            }
+            return result;
+        }
+        setupCellRefNavigation() {
+            const handleCellRef = (target) => {
+                const cellAddr = target.getAttribute('data-cell');
+                if (cellAddr) {
+                    this.navigateToCell(cellAddr);
+                }
+            };
+            this.container.addEventListener('click', (e) => {
+                const target = e.target.closest('.aichat-cell-ref');
+                if (target) {
+                    e.preventDefault();
+                    handleCellRef(target);
+                }
+            });
+            this.container.addEventListener('keydown', (e) => {
+                if (e.key !== 'Enter' && e.key !== ' ')
+                    return;
+                const target = e.target;
+                if (target && target.classList.contains('aichat-cell-ref')) {
+                    e.preventDefault();
+                    handleCellRef(target);
+                }
+            });
+        }
+        navigateToCell(cellAddress) {
+            // GoToCell reads the address in every reference style, so Budget.A5 and
+            // Budget!A5 both move the cursor, to another sheet if the address names one.
+            app.map.sendUnoCommand('.uno:GoToCell', {
+                ToPoint: { type: 'string', value: cellAddress },
+            });
+        }
+        async sanityCheckData() {
+            if (this.isProcessing)
+                return;
+            this.dropPendingDiagnosis();
+            if (!TextSelections.isActive()) {
+                this.hintText = _('Select the data you want to sanity-check first.');
+                this.updateHint();
+                return;
+            }
+            this.progressText = _('Analyzing selected data...');
+            this.updateMessagesArea();
+            let markdown;
+            try {
+                markdown = await this.fetchSelectedMarkdown();
+            }
+            catch (e) {
+                this.progressText = '';
+                if (e?.message === 'complexselection') {
+                    this.hintText = _('The selection contains images or other non-text content that cannot be sent as context.');
+                }
+                else {
+                    this.hintText = _('Failed to extract spreadsheet data.');
+                }
+                this.updateHint();
+                return;
+            }
+            this.progressText = '';
+            if (!markdown || !markdown.trim()) {
+                this.hintText = _('No data found in selection.');
+                this.updateHint();
+                return;
+            }
+            const prompt = this.buildSanityCheckPrompt();
+            const content = '[Selected text from document:\n```\n' +
+                markdown +
+                '\n```]\n\n' +
+                prompt;
+            this.messages.push({
+                role: 'user',
+                content: content,
+                displayContent: prompt,
+                selectedText: markdown,
+                timestamp: Date.now(),
+            });
+            this.inputText = '';
+            this.hintText = '';
+            this.isProcessing = true;
+            this.updateChatState(true);
+            this.updateHint();
+            this.dispatchRequest();
+        }
+        createSlides() {
+            this.promptFor(_('Describe the slides you want to create. For example: "A 5-slide overview of renewable energy" or "An introduction to our team".'));
+        }
+        generateImage() {
+            this.promptFor(_('Describe the image you want to generate. For example: "A watercolour of a mountain lake at sunrise".'));
+        }
+        generateSpeakerNotes() {
+            if (!this.isVisible())
+                this.show();
+            this.sendMessage(_('Write speaker notes for the current slide.'));
+        }
+        promptFor(hint) {
+            if (!this.isVisible())
+                this.show();
+            if (this.isProcessing)
+                return;
+            this.hintText = hint;
+            this.updateHint();
+            this.focusInput();
+        }
+        async createFormula() {
+            if (this.isProcessing)
+                return;
+            let context = '';
+            if (TextSelections.isActive()) {
+                try {
+                    const markdown = await this.fetchSelectedMarkdown();
+                    if (markdown && markdown.trim()) {
+                        context =
+                            '[Selected text from document:\n```\n' +
+                                markdown +
+                                '\n```]\n\n' +
+                                this.getCellReferenceInstructions() +
+                                '\n\n';
+                    }
+                }
+                catch {
+                    // No selection context available, proceed without it
+                }
+            }
+            this.hintText = _('Describe what formula you need. For example: "Calculate the average of column B" or "Sum all values where column A is greater than 100".');
+            this.pendingFormulaContext = context;
+            this.updateHint();
+        }
+        getCellReferenceInstructions() {
+            let instructions = '';
+            instructions +=
+                _('Read row numbers from the "Row" column — do not count or estimate row positions.') + ' ';
+            instructions +=
+                _("To identify a cell's column, match the value to the column letter in the header row — do not guess.") + ' ';
+            instructions +=
+                _('Reference a cell by combining its column header with the row number (e.g., column B + row 2 = B2).') + ' ';
+            instructions +=
+                _('The table shows what each cell displays. The "Formulas:" list below it gives the formula of each cell that has one.') + ' ';
+            instructions += _('When referencing specific cells, format each cell as a clickable link: [B2](cell://B2).');
+            return instructions;
+        }
+        buildSanityCheckPrompt() {
+            let prompt = _('Sanity check the following spreadsheet data.') + '\n\n';
+            prompt += _('Please analyze this data for:') + '\n';
+            prompt +=
+                '1. ' +
+                    _("Benford's Law violations — check if leading digit distribution of numeric values deviates significantly from the expected distribution, which may suggest data manipulation.") +
+                    '\n';
+            prompt +=
+                '2. ' +
+                    _('Statistical outliers — identify values that deviate significantly from their column or group.') +
+                    '\n';
+            prompt +=
+                '3. ' +
+                    _('General anomalies — suspicious patterns, unexpected duplicates, inconsistencies, or formatting issues.') +
+                    '\n\n';
+            prompt += this.getCellReferenceInstructions();
+            return prompt;
+        }
+        generateRequestId() {
+            return ('aichat-' +
+                Date.now().toString(36) +
+                '-' +
+                Math.random().toString(36).substring(2, 8));
+        }
+    }
+    cool.AIChatSidebar = AIChatSidebar;
+})(cool || (cool = {}));
+JSDialog.AIChatSidebar = null;
+JSDialog.getAIChatSidebar = function () {
+    if (!JSDialog.AIChatSidebar) {
+        JSDialog.AIChatSidebar = new cool.AIChatSidebar();
+    }
+    return JSDialog.AIChatSidebar;
+};

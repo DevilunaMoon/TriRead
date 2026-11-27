@@ -1,0 +1,878 @@
+/*
+ * Copyright the Collabora Online contributors.
+ *
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+/*
+    MouseControl class is for handling mouse events if no other section (bound to tiles)
+    handles it. This section is responsible for sending events to core side.
+    This section is bound to tiles section. Tiles section represents the document view.
+    Since this MouseControl class will handle mouse events that need to be sent to the core side,
+    binding this class to tiles is normal. This class shouldn't cover all the canvas but only the document area.
+*/
+class MouseControl extends CanvasSectionObject {
+    // A press inside the selection drags the selection, which only a clear drag does: the pointer
+    // moves further than selectionDragDistance CSS pixels, or the button is held still for
+    // selectionDragHoldTime milliseconds before the pointer moves. A slight slip of a touchpad
+    // press stays a click.
+    static { this.selectionDragDistance = 10; }
+    static { this.selectionDragHoldTime = 300; }
+    constructor(name) {
+        super(name);
+        this.zIndex = app.CSections.MouseControl.zIndex;
+        this.drawingOrder = app.CSections.MouseControl.drawingOrder;
+        this.processingOrder = app.CSections.MouseControl.processingOrder;
+        this.boundToSection = app.CSections.Tiles.name;
+        this.mouseMoveTimer = null;
+        this.clickTimer = null;
+        this.currentPosition = new cool.SimplePoint(0, 0);
+        this.clickCount = 0;
+        this.pendingClickInfo = null;
+        this.positionOnMouseDown = null;
+        // The keyboard modifier that was held when the button went down.
+        this.modifierOnMouseDown = 0;
+        this.localPositionOnMouseDown = null;
+        this.mouseDownSent = false;
+        /// True while a drag selects text here, without the server.
+        this.selectingText = false;
+        // Whether the press landed inside this view's selection.
+        this.pressedInSelection = false;
+        // When the button went down, and when the first drag move of this press arrived, both in
+        // milliseconds since the epoch. The second is zero until a drag move arrives.
+        this.timeOfPress = 0;
+        this.timeOfFirstDragMove = 0;
+        /// The selection this press is carrying, where the press marked the object itself. Null
+        /// while no such drag is running.
+        this.carrying = null;
+        // The last mouse position during a button-down drag, in canvas-local
+        // coordinates that do not include the scroll offset, together with the
+        // keyboard modifier that was active then. Kept so the drag position can be
+        // recomputed and re-sent when the view scrolls under a stationary mouse.
+        this.lastDragLocalPoint = null;
+        this.lastDragModifier = 0;
+        this.inSwipeAction = false;
+        this.swipeVelocity = [0, 0];
+        this.swipeTimeStamp = 0;
+        this.amplitude = [0, 0];
+        this.touchstart = 0;
+        // Section-local position of the previous touchmove during a one-finger drag.
+        this.lastTouchDragPoint = null;
+    }
+    static readModifier(e) {
+        let modifier = 0;
+        const shift = e.shiftKey ? app.UNOModifier.SHIFT : 0;
+        const ctrl = e.ctrlKey ? app.UNOModifier.CTRL : 0;
+        const alt = e.altKey ? app.UNOModifier.ALT : 0;
+        const cmd = e.metaKey ? app.UNOModifier.CTRLMAC : 0;
+        modifier = shift | ctrl | alt | cmd;
+        return modifier;
+    }
+    /*
+        We need to map view coordinates to document coordinates.
+        When user clicks at a position on the screen, we have its document coordinate according to
+        traditional document view: It starts from top-left and ends at bottom-right. Now the new ViewLayouts
+        can paint multiple parts at the same time and they can paint objects in different locations than the objects' original positions.
+        This means that the point user clicks/taps may not overlap with the document through simple math.
+        During this transition phase (to view layouts), we need both point.pX and point.vX properties. Later, we may use only vX, vY etc.
+
+        This function should be used only for real user interactions. If you want to simulate a click at a certain position, call _postMouseEvent directly.
+    */
+    postCoreMouseEvent(eventType, point, clickCount, buttons, modifier) {
+        const viewToDocumentPos = MouseControl.toDocumentPoint(point);
+        if (Number.isNaN(viewToDocumentPos.x) || Number.isNaN(viewToDocumentPos.y))
+            return;
+        else {
+            app.map._docLayer._postMouseEvent(eventType, viewToDocumentPos.x, viewToDocumentPos.y, clickCount, buttons, modifier);
+        }
+    }
+    // The place on the page under a point of the mouse position, which the active view layout
+    // may lay out in several pages side by side. Either coordinate is NaN when no page is there.
+    static toDocumentPoint(point) {
+        const canvasPoint = point.clone();
+        Util.ensureValue(app.activeDocument);
+        // Convert to pure canvas html element coordinate.
+        canvasPoint.pX +=
+            -app.activeDocument.activeLayout.viewedRectangle.pX1 +
+                app.sectionContainer.getDocumentAnchor()[0];
+        canvasPoint.pY +=
+            -app.activeDocument.activeLayout.viewedRectangle.pY1 +
+                app.sectionContainer.getDocumentAnchor()[1];
+        return app.activeDocument.activeLayout.canvasToDocumentPoint(canvasPoint);
+    }
+    /*
+        Hands a press that landed on a section over to the document, so that the menu is about
+        what lies under it on the page. A section is told where the press landed inside it, while
+        the document wants to know where that is on the page.
+    */
+    static contextMenuFrom(section, point, e) {
+        const activeDocument = app.activeDocument;
+        if (!activeDocument || !activeDocument.mouseControl)
+            return;
+        const viewed = activeDocument.activeLayout.viewedRectangle;
+        const anchor = section.containerObject.getDocumentAnchor();
+        point.pX = section.myTopLeft[0] + point.pX + viewed.pX1 - anchor[0];
+        point.pY = section.myTopLeft[1] + point.pY + viewed.pY1 - anchor[1];
+        activeDocument.mouseControl.setMousePosition(point);
+        activeDocument.mouseControl.onContextMenu(point, e);
+    }
+    onContextMenu(point, e) {
+        // We need this to prevent native context menu.
+        e.preventDefault();
+        // We will remove below ones after we remove map HTML element.
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        const buttons = app.LOButtons.right;
+        const modifier = MouseControl.readModifier(e);
+        // A double-click (count=2) is deferred by the 250ms timer.
+        // If the user right-clicks before it fires, flush it now.
+        this.flushPendingClick();
+        if (modifier === 0) {
+            this.postCoreMouseEvent('buttondown', this.currentPosition, 1, buttons, modifier);
+        }
+    }
+    // Transforms a point in document coordinates (twips) into a css-pixel
+    // position, either relative to the browser page or within the canvas.
+    _documentToCssPosition(pagePosition, browserPage) {
+        Util.ensureValue(app.activeDocument);
+        let docTLx = app.activeDocument.activeLayout.viewedRectangle.pX1;
+        let docTLy = app.activeDocument.activeLayout.viewedRectangle.pY1;
+        if (app.map.getDocType() === 'spreadsheet') {
+            if (app.isXOrdinateInFrozenPane(pagePosition.pX)) {
+                docTLx = 0;
+            }
+            if (app.isYOrdinateInFrozenPane(pagePosition.pY)) {
+                docTLy = 0;
+            }
+        }
+        pagePosition.pX -= docTLx - this.containerObject.getDocumentAnchor()[0];
+        pagePosition.pY -= docTLy - this.containerObject.getDocumentAnchor()[1];
+        if (browserPage) {
+            const boundingClientRectangle = this.context.canvas.getBoundingClientRect();
+            return {
+                x: pagePosition.cX + boundingClientRectangle.x,
+                y: pagePosition.cY + boundingClientRectangle.y,
+            };
+        }
+        return {
+            x: pagePosition.cX,
+            y: pagePosition.cY,
+        };
+    }
+    // Gets the mouse position either on browser page or within the
+    // canvas in css pixels.
+    _getMousePosition(browserPage) {
+        return this._documentToCssPosition(this.currentPosition.clone(), browserPage);
+    }
+    // Gets the mouse position on browser page in CSS pixels.
+    getMousePagePosition() {
+        return this._getMousePosition(true);
+    }
+    // Gets the mouse position on canvas in CSS pixels.
+    getMouseCanvasPosition() {
+        return this._getMousePosition(false);
+    }
+    // Gets the text caret (Writer, Impress) or active cell (Calc) position on
+    // the canvas in css pixels, or null when there is no visible cursor.
+    getCursorCanvasPosition() {
+        let rectangle = null;
+        if (app.calc.cellCursorVisible)
+            rectangle = app.calc.cellCursorRectangle;
+        else if (app.file.textCursor.visible)
+            rectangle = app.file.textCursor.rectangle;
+        if (!rectangle)
+            return null;
+        // Anchor at the bottom-left corner so the menu opens just below the
+        // caret or active cell instead of covering it.
+        const point = new cool.SimplePoint(rectangle.x1, rectangle.y2);
+        return this._documentToCssPosition(point, false);
+    }
+    // This is useful when a section handles the event but wants to set the document mouse position.
+    setMousePosition(point) {
+        this.currentPosition = point.clone();
+    }
+    refreshPosition(point) {
+        Util.ensureValue(app.activeDocument);
+        let topLeftX = app.activeDocument.activeLayout.viewedRectangle.pX1;
+        let topLeftY = app.activeDocument.activeLayout.viewedRectangle.pY1;
+        if (app.map.getDocType() === 'spreadsheet') {
+            if (app.isXOrdinateInFrozenPane(point.pX))
+                topLeftX = 0;
+            if (app.isYOrdinateInFrozenPane(point.pY))
+                topLeftY = 0;
+        }
+        this.currentPosition.pX = point.pX + topLeftX;
+        this.currentPosition.pY = point.pY + topLeftY;
+    }
+    setCursorType() {
+        /*
+            The shapes the client holds can say what lies under the mouse, so while they answer for
+            the pointer it is set from them and the engine is not asked. The answer arrives with the
+            mouse event.
+        */
+        // On a sheet the cells set their own pointer, except over an object.
+        const overTheCells = () => app.map._docLayer._docType === 'spreadsheet' &&
+            RenderGeometrySection.objectIdAt(this.currentPosition.x, this.currentPosition.y) === undefined;
+        if (RenderGeometrySection.answersPointer() && !overTheCells()) {
+            this.context.canvas.classList.remove('spreadsheet-cursor');
+            const pointer = RenderGeometrySection.pointerAt(this.currentPosition.x, this.currentPosition.y);
+            const cursor = Cursor.getCustomCursor(pointer) || pointer;
+            if (this.context.canvas.style.cursor !== cursor)
+                this.context.canvas.style.cursor = cursor;
+            return;
+        }
+        const corePointer = app.map._docLayer._coreMousePointer;
+        if (app.map._docLayer._docType === 'spreadsheet') {
+            // Core asks for a hand cursor over hyperlinks etc. The
+            // 'spreadsheet-cursor' class ('cursor: cell !important') would
+            // override the inline pointer core sets, so drop the class to let
+            // it show.
+            if (corePointer === 'pointer') {
+                const change = this.context.canvas.style.cursor !== 'pointer' ||
+                    this.context.canvas.classList.contains('spreadsheet-cursor');
+                if (change) {
+                    this.context.canvas.classList.remove('spreadsheet-cursor');
+                    this.context.canvas.style.cursor = 'pointer';
+                }
+                return;
+            }
+            const textCursor = app.file.textCursor.visible &&
+                app.calc.cellCursorRectangle &&
+                app.calc.cellCursorRectangle.pContainsPoint(this.currentPosition.pToArray());
+            if (textCursor) {
+                const change = this.context.canvas.style.cursor !== 'text' ||
+                    this.context.canvas.classList.contains('spreadsheet-cursor');
+                if (change) {
+                    this.context.canvas.classList.remove('spreadsheet-cursor');
+                    this.context.canvas.style.cursor = 'text';
+                }
+            }
+            else {
+                const change = this.context.canvas.style.cursor !== '' ||
+                    !this.context.canvas.classList.contains('spreadsheet-cursor');
+                if (change) {
+                    this.context.canvas.style.cursor = '';
+                    this.context.canvas.classList.add('spreadsheet-cursor');
+                }
+            }
+            return;
+        }
+        // If the core has set a specific pointer (e.g. 'pointer' for
+        // hyperlinks), let it take precedence over our client-side cursor.
+        if (corePointer && corePointer !== 'default')
+            return;
+        // If we have blinking cursor visible
+        // we need to change cursor from default style.
+        if (app.file.textCursor.visible) {
+            this.context.canvas.style.cursor = 'text';
+        }
+        else if (app.map._docLayer._docType === 'presentation') {
+            this.context.canvas.style.cursor = '';
+        }
+    }
+    cancelSwipe() {
+        this.inSwipeAction = false;
+        if (this.containerObject.getAnimatingSectionName() === this.name)
+            this.containerObject.stopAnimating();
+    }
+    // Scrolls by a core pixel distance, as a scroll the user makes with a finger. Returns
+    // true when the view position changed.
+    scrollViewBy(pX, pY) {
+        Util.ensureValue(app.activeDocument);
+        const userIsScrolling = true;
+        return app.activeDocument.activeLayout.scroll(pX, pY, userIsScrolling);
+    }
+    onDraw(frameCount, elapsedTime) {
+        if (this.inSwipeAction) {
+            const elapsed = Date.now() - this.swipeTimeStamp;
+            const delta = [
+                this.amplitude[0] * Math.exp(-elapsed / 650),
+                this.amplitude[1] * Math.exp(-elapsed / 650),
+            ];
+            if (Math.abs(delta[0]) > 0.2 || Math.abs(delta[1]) > 0.2) {
+                if (!this.scrollViewBy(delta[0], delta[1]))
+                    this.cancelSwipe();
+            }
+            else
+                this.cancelSwipe();
+        }
+    }
+    // Comment from original author:
+    /*
+        Code and maths for the ergonomic scrolling is inspired by formulas at
+        https://ariya.io/2013/11/javascript-kinetic-scrolling-part-2
+        Some constants are changed based on the testing/experimenting/trial-error
+    */
+    swipe(e) {
+        const pointVelocity = [e.velocityX, e.velocityY];
+        if (this.inSwipeAction) {
+            this.swipeVelocity[0] += pointVelocity[0];
+            this.swipeVelocity[1] += pointVelocity[1];
+        }
+        else {
+            this.swipeVelocity = pointVelocity;
+            this.inSwipeAction = true;
+        }
+        this.amplitude = [this.swipeVelocity[0] * 0.1, this.swipeVelocity[1] * 0.1];
+        this.swipeTimeStamp = Date.now();
+        const animatingSection = this.containerObject.getAnimatingSectionName();
+        if (!animatingSection)
+            this.startAnimating({ defer: true });
+        app.idleHandler.notifyActive();
+    }
+    onMouseMove(point, dragDistance, e) {
+        // Update the position first so the cursor type is computed for the
+        // current mouse location.
+        this.refreshPosition(point);
+        this.setCursorType();
+        // Not while dragging, or it would fire in the middle of a selection.
+        if (!this.containerObject.isDraggingSomething())
+            OtherViewCellCursorSection.checkHover([
+                point.pX + this.myTopLeft[0],
+                point.pY + this.myTopLeft[1],
+            ]);
+        if (this.clickTimer)
+            return;
+        clearTimeout(this.mouseMoveTimer);
+        const count = 1;
+        const modifier = MouseControl.readModifier(e);
+        if (!this.containerObject.isDraggingSomething()) {
+            this.mouseMoveTimer = setTimeout(() => {
+                this.postCoreMouseEvent('move', this.currentPosition, count, 0, modifier);
+            }, 100);
+        }
+        else if (e.type === 'touchmove' && this.lastTouchDragPoint) {
+            // For non-touch events, we can select text etc, so we send the mouse button events to core while dragging.
+            // Users can scroll the view using keyboard or mouse wheel, or the scroll bars in those devices.
+            // On touch devices, dragging (touchmove) is used to scroll the view.
+            // We don't send the mouse button down and up events to core while dragging (touchmove). Instead, we scroll the view.
+            // Scroll by the finger's travel. A canvas distance is valid in every view layout.
+            this.scrollViewBy(this.lastTouchDragPoint.pX - point.pX, this.lastTouchDragPoint.pY - point.pY);
+            this.lastTouchDragPoint = point.clone();
+        }
+        else {
+            this.lastDragLocalPoint = point.clone();
+            this.lastDragModifier = modifier;
+            // A press that landed on an object nobody had selected yet, and became a drag: in a
+            // view that draws from objects the client marks that object and carries it itself,
+            // so no drag of the engine's own is begun.
+            if (this.carryTheObject(modifier))
+                return;
+            // A press inside the selection drags the selection itself, so it selects no text
+            // here and waits for a clear drag before the engine hears of it.
+            if (this.pressedInSelection) {
+                if (!this.mouseDownSent && !this.isClearSelectionDrag(dragDistance))
+                    return;
+            }
+            // A drag that starts in the text being edited selects the text here.
+            else if (this.selectingText || this.startSelectingText()) {
+                point.pX += this.position[0];
+                point.pY += this.position[1];
+                app.map.fire('handleautoscroll', {
+                    pos: { x: point.cX, y: point.cY },
+                    map: app.map,
+                });
+                RenderManager.dragTextTo(this.currentPosition.x, this.currentPosition.y);
+                app.idleHandler.notifyActive();
+                return;
+            }
+            // The button-down goes to core only once the drag has started, but with the
+            // modifier held at the press. A key pressed later, such as Ctrl to copy,
+            // reaches core with the moves and the button-up.
+            if (!this.mouseDownSent && this.positionOnMouseDown) {
+                // The context toolbar belongs to the selection being dragged away. It shows again
+                // once the drag is over.
+                if (this.pressedInSelection)
+                    app.map.contextToolbar?.hideForDrag();
+                this.postCoreMouseEvent('buttondown', this.positionOnMouseDown, count, app.LOButtons.left, this.modifierOnMouseDown);
+                this.mouseDownSent = true;
+            }
+            // Autoscroll toward whichever viewport edge the pointer is near,
+            // whether it is just inside that edge or already past it. The handler
+            // gives zero velocity and stops autoscroll when the pointer is not near
+            // an edge, so a pointer resting in the middle does not scroll.
+            point.pX += this.position[0];
+            point.pY += this.position[1];
+            app.map.fire('handleautoscroll', {
+                pos: { x: point.cX, y: point.cY },
+                map: app.map,
+            });
+            this.postCoreMouseEvent('move', this.currentPosition, count, app.LOButtons.left, modifier);
+            this.showShapeDragPreview(dragDistance);
+        }
+        app.idleHandler.notifyActive();
+    }
+    // Shows unselected shapes drag preview
+    showShapeDragPreview(dragDistance) {
+        // Do not show in edit mode of inner edit engine
+        if (app.file.textCursor.visible || TextSelections.isActive())
+            return;
+        const handles = GraphicSelection.handlesSection;
+        if (!handles?.sectionProperties?.svg)
+            return;
+        if (handles?.sectionProperties?.hasVideo)
+            return;
+        if (!GraphicSelection.extraInfo?.isDraggable)
+            return;
+        // Pointer's current offset from drag start, in core pixels.
+        handles.sectionProperties.lastDragDistance = [
+            dragDistance[0],
+            dragDistance[1],
+        ];
+        this.containerObject.requestReDraw();
+        handles.sectionProperties.svg.style.left =
+            String((handles.myTopLeft[0] + dragDistance[0]) / app.dpiScale) + 'px';
+        handles.sectionProperties.svg.style.top =
+            String((handles.myTopLeft[1] + dragDistance[1]) / app.dpiScale) + 'px';
+        handles.sectionProperties.svg.style.opacity = '0.5';
+        handles.showSVG();
+    }
+    /*
+        Carries the object the press landed on, where the client draws the document from objects
+        and the press has turned into a drag. The object is marked first, which puts the section
+        that draws a selection there, and that section is then told where the drag goes. Answers
+        whether the drag is being carried here, so that nothing of it is sent to the engine.
+    */
+    carryTheObject(modifier) {
+        if (this.mouseDownSent)
+            return false;
+        if (!this.positionOnMouseDown)
+            return false;
+        if (!RenderGeometrySection.answersPointer())
+            return false;
+        if (app.file.textCursor.visible)
+            return false;
+        if (!this.carrying) {
+            // Which object a drag that begins there takes hold of is the context's business.
+            const hit = RenderGeometrySection.objectIdAt(this.positionOnMouseDown.x, this.positionOnMouseDown.y);
+            if (hit === undefined)
+                return false;
+            // where the press is, for a context that asks, the one of an object active in place
+            GraphicSelection.pressedAt = new cool.Point(this.positionOnMouseDown.x, this.positionOnMouseDown.y);
+            const objectId = Interaction.context().takesHoldFor(hit, modifier);
+            if (objectId === undefined)
+                return false;
+            // While an undo or a redo is on its way the objects stand where only the engine's
+            // answer tells, so the drag carries nothing then and nothing of it goes to the engine.
+            if (ChangeOutbox.undoOnItsWay()) {
+                GraphicSelection.selectionSection?.showTheHoldBack();
+                return true;
+            }
+            GraphicSelection.selectObjects([objectId]);
+            GraphicSelection.updateSelectionSection();
+            this.carrying = GraphicSelection.selectionSection;
+            if (!this.carrying)
+                return false;
+            this.carrying.beginCarrying(this.positionOnMouseDown);
+        }
+        this.carrying.carryTo(this.currentPosition);
+        return true;
+    }
+    /// Lets a carried object go where it now stands, or lets it be, and forgets it either way.
+    stopCarrying(finish) {
+        if (!this.carrying)
+            return;
+        if (finish)
+            this.carrying.finishCarrying(this.currentPosition);
+        else
+            this.carrying.cancelCarrying();
+        this.carrying = null;
+    }
+    // Whether a drag from inside the selection is clear enough to move the selection.
+    isClearSelectionDrag(dragDistance) {
+        if (!this.timeOfFirstDragMove)
+            this.timeOfFirstDragMove = Date.now();
+        const distance = Math.hypot(dragDistance[0], dragDistance[1]) / app.dpiScale;
+        return (distance > MouseControl.selectionDragDistance ||
+            this.timeOfFirstDragMove - this.timeOfPress >=
+                MouseControl.selectionDragHoldTime);
+    }
+    /// Whether the document was told to drag as well, which it then has to be told to stop.
+    startedDocumentDrag() {
+        return this.mouseDownSent;
+    }
+    /*
+        The drag is off: the copy of the shape that followed the mouse goes back, and nothing more
+        of this press is sent to the document - the button coming up would otherwise finish a drag
+        that is no longer wanted.
+    */
+    onDragCancel() {
+        DropCaretSection.hide();
+        this.stopCarrying(false);
+        this.hideShapeDragPreview();
+        this.stopSelectingText();
+        this.mouseDownSent = false;
+        this.positionOnMouseDown = null;
+        this.lastDragLocalPoint = null;
+        this.pressedInSelection = false;
+    }
+    hideShapeDragPreview() {
+        const handles = GraphicSelection.handlesSection;
+        if (!handles?.sectionProperties?.svg)
+            return;
+        handles.sectionProperties.lastDragDistance = [0, 0];
+        handles.sectionProperties.svg.style.opacity = '1';
+        handles.hideSVG();
+    }
+    // Called whenever the document scrolls or pans. During a button-down drag
+    // the mouse can stay still while the view moves, so the mouse now points at
+    // a different document position. Recompute that position from the unchanged
+    // screen point and re-send the drag move so the selection follows the view.
+    onNewDocumentTopLeft() {
+        if (this.selectingText && this.lastDragLocalPoint) {
+            this.refreshPosition(this.lastDragLocalPoint);
+            RenderManager.dragTextTo(this.currentPosition.x, this.currentPosition.y);
+            return;
+        }
+        if (!this.mouseDownSent || !this.lastDragLocalPoint)
+            return;
+        this.refreshPosition(this.lastDragLocalPoint);
+        this.postCoreMouseEvent('move', this.currentPosition, 1, app.LOButtons.left, this.lastDragModifier);
+    }
+    onMouseDown(point, e) {
+        this.refreshPosition(point);
+        this.positionOnMouseDown = this.currentPosition.clone();
+        this.modifierOnMouseDown = MouseControl.readModifier(e);
+        this.timeOfPress = Date.now();
+        this.timeOfFirstDragMove = 0;
+        // A press with Shift extends the selection, so it drags no selection.
+        this.pressedInSelection =
+            e.type !== 'touchstart' &&
+                !(this.modifierOnMouseDown & app.UNOModifier.SHIFT) &&
+                !!app.activeDocument?.activeView.selectionContains(MouseControl.toDocumentPoint(this.positionOnMouseDown));
+        if (e.type === 'touchstart') {
+            // For swipe action.
+            this.localPositionOnMouseDown = point.clone();
+            this.lastTouchDragPoint = point.clone();
+            this.touchstart = Date.now();
+        }
+    }
+    onMouseUp(point, e) {
+        this.refreshPosition(point);
+        this.stopCarrying(true);
+        this.stopSelectingText();
+        this.hideShapeDragPreview();
+        DropCaretSection.hide();
+        if (this.mouseDownSent) {
+            this.postCoreMouseEvent('buttonup', this.currentPosition, 1, app.LOButtons.left, MouseControl.readModifier(e));
+            app.map.fire('scrollvelocity', { vx: 0, vy: 0 });
+        }
+        else if (this.pressedInSelection &&
+            this.positionOnMouseDown &&
+            this.containerObject.isDraggingSomething()) {
+            // A press inside the selection that never became a clear drag is a click there.
+            this.sendClick({
+                sendingPosition: this.positionOnMouseDown,
+                buttons: app.LOButtons.left,
+                modifier: this.modifierOnMouseDown,
+            }, 1);
+        }
+        else if (e.type === 'touchend' && this.localPositionOnMouseDown) {
+            // For swipe action.
+            const diff = new cool.SimplePoint(this.localPositionOnMouseDown.x - point.x, this.localPositionOnMouseDown.y - point.y);
+            const timeDiff = Date.now() - this.touchstart;
+            if (timeDiff < 200 && (Math.abs(diff.cX) > 5 || Math.abs(diff.cY) > 5))
+                this.swipe({ velocityX: diff.pX, velocityY: diff.pY });
+            else if (this.inSwipeAction)
+                this.cancelSwipe();
+            this.localPositionOnMouseDown = null;
+        }
+        this.positionOnMouseDown = null;
+        this.lastTouchDragPoint = null;
+        this.mouseDownSent = false;
+        this.lastDragLocalPoint = null;
+        this.pressedInSelection = false;
+        // A touch pan is a drag too.
+        if (this.containerObject.isDraggingSomething())
+            app.map.refocus();
+    }
+    onMouseEnter(point, e) {
+        if (app.map._docLayer._docType === 'spreadsheet') {
+            this.context.canvas.classList.add('spreadsheet-cursor');
+        }
+        this.context.canvas.style.cursor = '';
+    }
+    onMouseLeave(point, e) {
+        // Normally, we don't change the cursor style on mouse leave.
+        // That is responsibility of the new target section.
+        // But this is a class name and we need to remove it.
+        if (app.map._docLayer._docType === 'spreadsheet') {
+            this.context.canvas.classList.remove('spreadsheet-cursor');
+            OtherViewCellCursorSection.resetHover();
+        }
+    }
+    getMobileKeyboardVisibility() {
+        if (!app.map._docLayer)
+            return false;
+        else if (app.map._docLayer._docType === 'text')
+            return true;
+        else if (app.map._docLayer._docType === 'spreadsheet') {
+            const acceptInput = app.calc.cellCursorVisible &&
+                app.calc.cellCursorRectangle &&
+                app.calc.cellCursorRectangle.containsPoint(this.currentPosition.toArray());
+            return acceptInput;
+        }
+        else
+            return false;
+    }
+    sendClick(clickInfo, count) {
+        this.postCoreMouseEvent('buttondown', clickInfo.sendingPosition, count, clickInfo.buttons, clickInfo.modifier);
+        this.postCoreMouseEvent('buttonup', clickInfo.sendingPosition, count, clickInfo.buttons, clickInfo.modifier);
+    }
+    /*
+        Answers a click from the geometry the client holds, where the context takes it. The hit
+        test is asked at the position of this click, so what is marked is what the click met and
+        not what the mouse passed over earlier.
+
+        False where the click is not one for selecting here: another button, a document not drawn
+        from objects, a click while a text edit runs, which the engine ends on its own, or one the
+        context leaves to the engine. Those take the click path to the engine.
+    */
+    selectObjectAt(point, buttons, modifier) {
+        if (buttons !== app.LOButtons.left)
+            return false;
+        if (!RenderGeometrySection.answersPointer())
+            return false;
+        if (app.file.textCursor.visible)
+            return false;
+        // where the press is, for a context that asks, the one of an object active in place
+        GraphicSelection.pressedAt = new cool.Point(point.x, point.y);
+        const alt = app.UNOModifier.ALT;
+        const taken = modifier === alt || modifier === (alt | app.UNOModifier.SHIFT)
+            ? Interaction.context().altPress(RenderGeometrySection.objectIdsAt(point.x, point.y), modifier !== alt)
+            : Interaction.context().press(RenderGeometrySection.objectIdAt(point.x, point.y), modifier);
+        // The selection the click made is drawn at once, with its handles, so it can be worked
+        // on before the engine reports it.
+        if (taken)
+            GraphicSelection.updateSelectionSection();
+        return taken;
+    }
+    /// True while text is edited and the client answers presses in it from the objects it
+    /// holds.
+    static editsTextHere() {
+        return (app.file.textCursor.visible && RenderGeometrySection.answersPointer());
+    }
+    /// Starts a drag that selects text here when a plain left press landed in the edited text.
+    /// Any other press goes to the engine.
+    startSelectingText() {
+        const press = this.positionOnMouseDown;
+        if (!press || this.mouseDownSent || this.modifierOnMouseDown !== 0)
+            return false;
+        if (!MouseControl.editsTextHere())
+            return false;
+        this.selectingText = RenderManager.startTextDrag(press.x, press.y, RenderGeometrySection.objectIdAt(press.x, press.y));
+        return this.selectingText;
+    }
+    stopSelectingText() {
+        if (!this.selectingText)
+            return;
+        this.selectingText = false;
+        // The drag was scrolling the view while it reached past the edge.
+        app.map.fire('scrollvelocity', { vx: 0, vy: 0 });
+        RenderManager.endTextDrag();
+    }
+    /// Puts the caret where a plain left click lands in the edited text, without the server.
+    /// False when the click is for the engine: another button, a modifier, no text edit, or a
+    /// point off the text.
+    placeCaretAt(point, buttons, modifier) {
+        if (buttons !== app.LOButtons.left || modifier !== 0)
+            return false;
+        if (!MouseControl.editsTextHere())
+            return false;
+        return RenderManager.placeCaretAt(point.x, point.y, RenderGeometrySection.objectIdAt(point.x, point.y));
+    }
+    /// Selects the word under a double click, or the paragraph under a triple click, without
+    /// the server. False when the click is for the engine, as for a single click, or is a
+    /// fourth click or more.
+    selectTextAt(clickInfo, count) {
+        if (clickInfo.buttons !== app.LOButtons.left || clickInfo.modifier !== 0)
+            return false;
+        if (!MouseControl.editsTextHere())
+            return false;
+        const point = clickInfo.sendingPosition;
+        const hitId = RenderGeometrySection.objectIdAt(point.x, point.y);
+        if (count === 2)
+            return RenderManager.selectWordAt(point.x, point.y, hitId);
+        if (count === 3)
+            return RenderManager.selectParagraphAt(point.x, point.y, hitId);
+        return false;
+    }
+    /*
+        Whether the context takes a double press itself, on the same terms as a single press is
+        taken from the geometry the client holds.
+    */
+    doublePressTaken(clickInfo) {
+        if (clickInfo.buttons !== app.LOButtons.left || clickInfo.modifier !== 0)
+            return false;
+        if (!RenderGeometrySection.answersPointer())
+            return false;
+        if (app.file.textCursor.visible)
+            return false;
+        const at = clickInfo.sendingPosition;
+        return Interaction.context().doublePress(RenderGeometrySection.objectIdAt(at.x, at.y));
+    }
+    // A tap outside the open wizard only puts it away, so the cursor stays and a format picked
+    // with nothing selected still applies to the next typed text. A snackbar passes it on.
+    wizardTakesTheTap() {
+        if (window.mode.isDesktop())
+            return false;
+        const wizard = app.map.uiManager.mobileWizard;
+        if (!wizard || !wizard.isOpen())
+            return false;
+        const element = document.getElementById('mobile-wizard');
+        return !(element && element.classList.contains('snackbar'));
+    }
+    onClick(point, e) {
+        if (this.wizardTakesTheTap()) {
+            app.map.fire('closemobilewizard');
+            return;
+        }
+        app.map.fire('closepopups');
+        app.map.fire('editorgotfocus');
+        this.refreshPosition(point);
+        this.clickCount++;
+        if (!window.mode.isDesktop())
+            app.map.fire('closemobilewizard');
+        // Right click is not supported. And click event doesn't have "buttons" property set. Safe to set it here to default.
+        let buttons = app.LOButtons.left;
+        let modifier = MouseControl.readModifier(e);
+        const sendingPosition = this.currentPosition.clone();
+        // Turn ctrl-left-click into right-click for browsers on macOS
+        if (window.L.Browser.mac) {
+            if (modifier == app.UNOModifier.CTRL && buttons == app.LOButtons.left) {
+                modifier = 0;
+                buttons = app.LOButtons.right;
+            }
+        }
+        const clickInfo = {
+            sendingPosition: sendingPosition,
+            buttons: buttons,
+            modifier: modifier,
+        };
+        /*
+            Alt goes through the objects under the mouse one press at a time, so two presses close
+            together are two steps, not a double press: each is answered at once and none is kept
+            to be counted with the next.
+        */
+        const alt = app.UNOModifier.ALT;
+        if ((modifier === alt || modifier === (alt | app.UNOModifier.SHIFT)) &&
+            this.selectObjectAt(sendingPosition, buttons, modifier)) {
+            if (this.clickTimer)
+                app.timerRegistry.clearTimeout(this.clickTimer);
+            this.clickTimer = null;
+            this.pendingClickInfo = null;
+            this.clickCount = 0;
+            return;
+        }
+        /*
+            In a view that draws from objects a second click counts toward a double click only
+            close to the first one. One further away is a click of its own, so clicks quickly from
+            one object to the next each select their object here.
+        */
+        const pending = this.pendingClickInfo?.sendingPosition;
+        const reach = 4 * app.dpiScale;
+        if (this.clickTimer &&
+            pending &&
+            RenderGeometrySection.answersPointer() &&
+            (Math.abs(pending.pX - sendingPosition.pX) > reach ||
+                Math.abs(pending.pY - sendingPosition.pY) > reach)) {
+            this.clickCount--;
+            this.flushPendingClick();
+            this.clickCount = 1;
+        }
+        if (this.clickTimer)
+            app.timerRegistry.clearTimeout(this.clickTimer);
+        else {
+            // Old code always sends the first click, so do we, unless the client marks
+            // the object or places the caret itself. A second click within the timer
+            // counts with it, and is answered here or sent when the timer runs out.
+            if (!this.selectObjectAt(sendingPosition, buttons, modifier) &&
+                !this.placeCaretAt(sendingPosition, buttons, modifier))
+                this.sendClick(clickInfo, 1);
+            // For future: Here, we are checking the window size to determine the view mode, we can also check the event type (touch/click).
+            app.map.focus(window.mode.isDesktop()
+                ? undefined
+                : this.getMobileKeyboardVisibility());
+        }
+        this.pendingClickInfo = clickInfo;
+        this.clickTimer = app.timerRegistry.setTimeout('clicktimer', () => {
+            this.flushPendingClick();
+        }, 250);
+    }
+    // Over a hyperlink, the middle button opens it, the same as Ctrl+Click:
+    // send a single left-button click carrying the platform's link modifier
+    // so core reports the hyperlink. On macOS the link modifier is the
+    // command key; elsewhere it is the control key.
+    //
+    // Elsewhere, the middle button pastes the primary selection, the
+    // browser's own default action for the press. Send a plain left click
+    // with no modifier first, so the cell or text cursor moves to the
+    // pointer before that paste happens, the same as a left click would
+    // move it, instead of the paste landing wherever the cursor was left
+    // before.
+    onMiddleClick(point, e, openHyperlink) {
+        this.refreshPosition(point);
+        const modifier = openHyperlink
+            ? window.L.Browser.mac
+                ? app.UNOModifier.CTRLMAC
+                : app.UNOModifier.CTRL
+            : 0;
+        this.sendClick({
+            sendingPosition: this.currentPosition.clone(),
+            buttons: app.LOButtons.left,
+            modifier: modifier,
+        }, 1);
+        app.map.focus(window.mode.isDesktop()
+            ? undefined
+            : this.getMobileKeyboardVisibility());
+    }
+    // Send the deferred multi-click immediately and cancel the pending timer.
+    flushPendingClick() {
+        if (this.clickTimer) {
+            app.timerRegistry.clearTimeout(this.clickTimer);
+            this.clickTimer = null;
+        }
+        const clickInfo = this.pendingClickInfo;
+        if (clickInfo) {
+            if (this.clickCount === 3 && app.map._docLayer.isCalc()) {
+                // Also send a double click for a triple click in Calc.
+                this.sendClick(clickInfo, 2);
+                this.sendClick(clickInfo, 3);
+            }
+            else if (this.clickCount > 1) {
+                const taken = (this.clickCount === 2 && this.doublePressTaken(clickInfo)) ||
+                    this.selectTextAt(clickInfo, this.clickCount);
+                if (!taken)
+                    this.sendClick(clickInfo, this.clickCount);
+            }
+        }
+        this.pendingClickInfo = null;
+        this.clickCount = 0;
+    }
+    // Pinch zoom is handled by ZoomControl (a window section that receives the
+    // same multi-touch events). Here we only interrupt an ongoing swipe.
+    onMultiTouchStart(e) {
+        if (this.inSwipeAction)
+            this.containerObject.stopAnimating();
+    }
+    // Click at the given point, so that the insert position is as close to it as possible. The point
+    // is local to this section, in core pixels.
+    moveCursorToPoint(point, modifier) {
+        this.refreshPosition(point);
+        this.postCoreMouseEvent('buttondown', this.currentPosition, 1, app.LOButtons.left, modifier);
+        this.postCoreMouseEvent('buttonup', this.currentPosition, 1, app.LOButtons.left, modifier);
+    }
+    onDrop(position, e) {
+        this.moveCursorToPoint(position, MouseControl.readModifier(e));
+        if (app.map._clip && e.dataTransfer) {
+            // Always capture the html content separate as we may lose it when we
+            // pass the clipboard data to a different context (async calls, f.e.).
+            const htmlText = e.dataTransfer.getData('text/html');
+            app.map._clip.dataTransferToDocument(e.dataTransfer, 
+            /* preferInternal = */ false, htmlText);
+        }
+    }
+}

@@ -17,14 +17,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
-import androidx.compose.material.icons.rounded.Article
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Fullscreen
 import androidx.compose.material.icons.rounded.FullscreenExit
 import androidx.compose.material.icons.rounded.ScreenRotation
-import androidx.compose.material.icons.rounded.SpeakerNotes
-import androidx.compose.material.icons.rounded.TextFields
 import androidx.compose.material.icons.rounded.ViewCarousel
 import androidx.compose.material.icons.rounded.ViewStream
 import androidx.compose.material3.Button
@@ -53,7 +50,6 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.triread.app.ui.viewer.components.DocSettingsBottomSheet
 import com.triread.app.ui.viewer.components.DocViewerContent
 import com.triread.app.ui.viewer.components.PdfViewerContent
 import com.triread.app.ui.viewer.components.PptViewerContent
@@ -67,6 +63,13 @@ fun ViewerScreen(
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val view = LocalView.current
+    val activity = view.context as? Activity
+
+    LaunchedEffect(activity) {
+        if (activity != null) {
+            viewModel.loadDocumentIfNeeded(activity)
+        }
+    }
 
     LockLandscapeEffect(isLandscape = uiState.isLandscape)
 
@@ -75,7 +78,7 @@ fun ViewerScreen(
     }
 
     LaunchedEffect(uiState.isImmersive) {
-        val window = (view.context as? Activity)?.window ?: return@LaunchedEffect
+        val window = activity?.window ?: return@LaunchedEffect
         val controller = WindowCompat.getInsetsController(window, view)
         controller.systemBarsBehavior =
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -88,7 +91,7 @@ fun ViewerScreen(
 
     DisposableEffect(Unit) {
         onDispose {
-            val window = (view.context as? Activity)?.window ?: return@onDispose
+            val window = activity?.window ?: return@onDispose
             WindowCompat.getInsetsController(window, view)
                 .show(WindowInsetsCompat.Type.systemBars())
         }
@@ -109,7 +112,7 @@ fun ViewerScreen(
                 ViewerErrorState(
                     title = content.title,
                     message = content.message,
-                    onRetry = viewModel::loadDocument,
+                    onRetry = { activity?.let { viewModel.reloadDocument(it) } },
                     onBack = onNavigateBack
                 )
             }
@@ -122,43 +125,38 @@ fun ViewerScreen(
                     isImmersive = uiState.isImmersive,
                     renderedPages = content.renderedPages,
                     onPageChanged = viewModel::onPageChanged,
-                    onViewportWidthChanged = viewModel::onPdfViewportWidthChanged,
+                    onViewportWidthChanged = viewModel::onViewportWidthChanged,
                     onToggleImmersive = viewModel::toggleImmersiveMode
                 )
             }
 
             is ViewerContentState.DocReady -> {
                 DocViewerContent(
-                    blocks = content.blocks,
-                    initialBlockIndex = content.initialBlockIndex,
-                    pageMetrics = content.pageMetrics,
-                    header = content.header,
-                    footer = content.footer,
-                    noticeMessage = content.noticeMessage,
-                    settings = uiState.typographySettings,
+                    totalPages = content.totalPages,
+                    initialPage = content.initialPage,
                     isImmersive = uiState.isImmersive,
-                    onVisibleBlockChanged = viewModel::onDocVisibleBlockChanged,
-                    onPrintPageChanged = viewModel::onDocPrintPageChanged,
+                    renderedPages = content.renderedPages,
+                    pageAspectRatios = content.pageAspectRatios,
+                    onPageChanged = viewModel::onPageChanged,
+                    onViewportWidthChanged = viewModel::onViewportWidthChanged,
                     onToggleImmersive = viewModel::toggleImmersiveMode
                 )
             }
 
             is ViewerContentState.PptReady -> {
                 PptViewerContent(
-                    slides = content.slides,
-                    initialSlide = uiState.currentPage,
-                    slideAspectRatio = content.slideAspectRatio,
-                    slideWidthPt = content.slideWidthPt,
-                    showSpeakerNotes = uiState.showSpeakerNotes,
-                    isLandscape = uiState.isLandscape,
+                    totalSlides = content.totalSlides,
+                    initialSlide = content.initialSlide,
                     isImmersive = uiState.isImmersive,
+                    renderedSlides = content.renderedSlides,
                     onSlideChanged = viewModel::onPageChanged,
+                    onViewportWidthChanged = viewModel::onViewportWidthChanged,
                     onToggleImmersive = viewModel::toggleImmersiveMode
                 )
             }
         }
 
-        // Overlay TopAppBar (TopAppBar natively handles statusBars insets so there is no dark gap above it)
+        // Overlay TopAppBar
         AnimatedVisibility(
             visible = !uiState.isImmersive,
             enter = fadeIn() + slideInVertically { -it },
@@ -186,7 +184,7 @@ fun ViewerScreen(
                     }
                 },
                 actions = {
-                    when (val content = uiState.contentState) {
+                    when (uiState.contentState) {
                         is ViewerContentState.PdfReady -> {
                             IconButton(onClick = viewModel::togglePdfReadingMode) {
                                 Icon(
@@ -218,46 +216,26 @@ fun ViewerScreen(
                         }
 
                         is ViewerContentState.DocReady -> {
-                            IconButton(
-                                onClick = {
-                                    viewModel.togglePrintLayout(!uiState.typographySettings.isPrintLayout)
-                                }
-                            ) {
+                            IconButton(onClick = viewModel::toggleLandscape) {
                                 Icon(
-                                    imageVector = Icons.Rounded.Article,
-                                    contentDescription = "Toggle Print Layout",
-                                    tint = if (uiState.typographySettings.isPrintLayout) {
+                                    imageVector = Icons.Rounded.ScreenRotation,
+                                    contentDescription = "Toggle horizontal screen",
+                                    tint = if (uiState.isLandscape) {
                                         MaterialTheme.colorScheme.primary
                                     } else {
                                         MaterialTheme.colorScheme.onSurface
                                     }
                                 )
                             }
-                            IconButton(onClick = viewModel::toggleSettingsSheet) {
+                            IconButton(onClick = viewModel::toggleImmersiveMode) {
                                 Icon(
-                                    imageVector = Icons.Rounded.TextFields,
-                                    contentDescription = "Reading settings"
+                                    imageVector = Icons.Rounded.Fullscreen,
+                                    contentDescription = "Full screen"
                                 )
                             }
                         }
 
                         is ViewerContentState.PptReady -> {
-                            val currentSlideNotes = content.slides
-                                .getOrNull(uiState.currentPage)
-                                ?.speakerNotes
-                            if (!currentSlideNotes.isNullOrBlank()) {
-                                IconButton(onClick = viewModel::toggleSpeakerNotes) {
-                                    Icon(
-                                        imageVector = Icons.Rounded.SpeakerNotes,
-                                        contentDescription = "Toggle speaker notes",
-                                        tint = if (uiState.showSpeakerNotes) {
-                                            MaterialTheme.colorScheme.primary
-                                        } else {
-                                            MaterialTheme.colorScheme.onSurface
-                                        }
-                                    )
-                                }
-                            }
                             IconButton(onClick = viewModel::toggleFullscreenHorizontal) {
                                 Icon(
                                     imageVector = if (uiState.isLandscape) {
@@ -301,10 +279,10 @@ fun ViewerScreen(
                 "Page"
             }
             val displayPage = (uiState.currentPage + 1).coerceIn(1, uiState.totalPages)
-            val modeTag = when (uiState.contentState) {
-                is ViewerContentState.PdfReady -> " · ${uiState.pdfReadingMode.label}"
-                is ViewerContentState.DocReady -> if (uiState.typographySettings.isPrintLayout) " · Print" else ""
-                else -> ""
+            val modeTag = if (uiState.contentState is ViewerContentState.PdfReady) {
+                " · ${uiState.pdfReadingMode.label}"
+            } else {
+                ""
             }
 
             Surface(
@@ -331,17 +309,6 @@ fun ViewerScreen(
                 }
             }
         }
-    }
-
-    if (uiState.showSettingsSheet && uiState.contentState is ViewerContentState.DocReady) {
-        DocSettingsBottomSheet(
-            settings = uiState.typographySettings,
-            onTogglePrintLayout = viewModel::togglePrintLayout,
-            onSelectTheme = viewModel::selectReaderTheme,
-            onFontSizeChange = viewModel::updateFontSize,
-            onLineSpacingChange = viewModel::updateLineSpacing,
-            onDismiss = viewModel::dismissSettingsSheet
-        )
     }
 }
 

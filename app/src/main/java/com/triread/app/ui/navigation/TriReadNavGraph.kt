@@ -107,8 +107,7 @@ fun TriReadNavGraph(
                     uriString = decodedUri,
                     appContext = container.appContext,
                     repository = container.documentRepository,
-                    docxParser = container.docxParser,
-                    pptxParser = container.pptxParser
+                    loKitEngine = container.loKitEngine
                 )
             )
             ViewerScreen(
