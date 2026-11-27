@@ -30,23 +30,23 @@ public class LOActivity {
     }
 
     private final Activity activity;
-    private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private WebView webView;
-    private volatile boolean coolwsdStarted = false;
-    private Runnable onDocumentClosedCallback;
+    private static final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private static volatile WebView activeWebView;
+    private static volatile boolean coolwsdStarted = false;
+    private static volatile Runnable activeCloseCallback;
 
     public LOActivity(Activity activity) {
         this.activity = activity;
     }
 
     public void attachWebView(WebView webView, Runnable onDocumentClosedCallback) {
-        this.webView = webView;
-        this.onDocumentClosedCallback = onDocumentClosedCallback;
+        activeWebView = webView;
+        activeCloseCallback = onDocumentClosedCallback;
     }
 
     public void detachWebView() {
-        this.webView = null;
-        this.onDocumentClosedCallback = null;
+        activeWebView = null;
+        activeCloseCallback = null;
     }
 
     public synchronized void ensureInitializedAndStart(String fileUriString, String userName) {
@@ -141,12 +141,12 @@ public class LOActivity {
      */
     @SuppressWarnings("unused")
     public void rawCallFakeWebsocketOnMessage(final byte[] message) {
-        if (message == null || webView == null) {
+        if (message == null || activeWebView == null) {
             return;
         }
         final String b64 = Base64.encodeToString(message, Base64.NO_WRAP);
         mainHandler.post(() -> {
-            WebView wv = webView;
+            WebView wv = activeWebView;
             if (wv != null) {
                 String js = "if (window.TheFakeWebSocket && window.TheFakeWebSocket.onmessage) { " +
                         "window.TheFakeWebSocket.onmessage({ data: Base64ToArrayBuffer('" + b64 + "') }); }";
@@ -186,7 +186,7 @@ public class LOActivity {
                 return;
             }
             if ("BYE".equals(message)) {
-                Runnable cb = onDocumentClosedCallback;
+                Runnable cb = activeCloseCallback;
                 if (cb != null) {
                     mainHandler.post(cb);
                 }
