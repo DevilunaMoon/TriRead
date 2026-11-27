@@ -2,13 +2,14 @@ name: Build TriRead APK
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
   build:
+    name: Build Debug & Release APKs
     runs-on: ubuntu-latest
 
     steps:
@@ -21,17 +22,33 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - name: Set up Gradle
+      - name: Set up Gradle 8.10.2
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.7
+          gradle-version: 8.10.2
 
-      - name: Build Debug APK
-        run: gradle assembleDebug
+      - name: Build Debug APK (installable on phone)
+        run: gradle assembleDebug --stacktrace
 
-      - name: Upload TriRead APK
+      - name: Build Release APK (R8 minified)
+        run: gradle assembleRelease --stacktrace
+
+      - name: Print APK sizes
+        run: |
+          echo "### TriRead APK Build Sizes" >> $GITHUB_STEP_SUMMARY
+          ls -lh app/build/outputs/apk/debug/*.apk app/build/outputs/apk/release/*.apk | awk '{print "- `" $9 "` — **" $5 "**"}' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
           name: TriRead-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
-          retention-days: 30
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload Release APK (unsigned)
+        uses: actions/upload-artifact@v4
+        with:
+          name: TriRead-release-apk
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+

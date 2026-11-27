@@ -1,0 +1,82 @@
+package com.triread.app.ui.navigation
+
+import android.net.Uri
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavType
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
+import androidx.navigation.navArgument
+import com.triread.app.AppContainer
+import com.triread.app.ui.dashboard.DashboardScreen
+import com.triread.app.ui.dashboard.DashboardViewModel
+import com.triread.app.ui.viewer.ViewerScreen
+import com.triread.app.ui.viewer.ViewerViewModel
+
+object TriReadRoutes {
+    const val DASHBOARD = "dashboard"
+    const val VIEWER_ARG_URI = "encodedUri"
+    const val VIEWER_PATTERN = "viewer/{$VIEWER_ARG_URI}"
+
+    fun viewerRoute(uriString: String): String = "viewer/${Uri.encode(uriString)}"
+}
+
+@Composable
+fun TriReadNavGraph(
+    container: AppContainer,
+    initialDocumentUri: String? = null,
+    onInitialDocumentConsumed: () -> Unit = {}
+) {
+    val navController = rememberNavController()
+
+    LaunchedEffect(initialDocumentUri) {
+        if (!initialDocumentUri.isNullOrBlank()) {
+            navController.navigate(TriReadRoutes.viewerRoute(initialDocumentUri)) {
+                launchSingleTop = true
+            }
+            onInitialDocumentConsumed()
+        }
+    }
+
+    NavHost(
+        navController = navController,
+        startDestination = TriReadRoutes.DASHBOARD
+    ) {
+        composable(TriReadRoutes.DASHBOARD) {
+            val dashboardViewModel: DashboardViewModel = viewModel(
+                factory = DashboardViewModel.provideFactory(container.documentRepository)
+            )
+            DashboardScreen(
+                viewModel = dashboardViewModel,
+                onOpenDocument = { uriString ->
+                    navController.navigate(TriReadRoutes.viewerRoute(uriString))
+                }
+            )
+        }
+
+        composable(
+            route = TriReadRoutes.VIEWER_PATTERN,
+            arguments = listOf(
+                navArgument(TriReadRoutes.VIEWER_ARG_URI) { type = NavType.StringType }
+            )
+        ) { backStackEntry ->
+            val encodedUri = backStackEntry.arguments?.getString(TriReadRoutes.VIEWER_ARG_URI).orEmpty()
+            val decodedUri = Uri.decode(encodedUri)
+            val viewerViewModel: ViewerViewModel = viewModel(
+                factory = ViewerViewModel.provideFactory(
+                    uriString = decodedUri,
+                    appContext = container.appContext,
+                    repository = container.documentRepository,
+                    docxParser = container.docxParser,
+                    pptxParser = container.pptxParser
+                )
+            )
+            ViewerScreen(
+                viewModel = viewerViewModel,
+                onNavigateBack = { navController.popBackStack() }
+            )
+        }
+    }
+}
