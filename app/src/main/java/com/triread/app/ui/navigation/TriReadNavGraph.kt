@@ -107,7 +107,7 @@ fun TriReadNavGraph(
                     uriString = decodedUri,
                     appContext = container.appContext,
                     repository = container.documentRepository,
-                    loKitEngine = container.loKitEngine
+                    tempFileManager = container.collaboraTempFileManager
                 )
             )
             ViewerScreen(

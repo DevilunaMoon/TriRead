@@ -65,12 +65,6 @@ fun ViewerScreen(
     val view = LocalView.current
     val activity = view.context as? Activity
 
-    LaunchedEffect(activity) {
-        if (activity != null) {
-            viewModel.loadDocumentIfNeeded(activity)
-        }
-    }
-
     LockLandscapeEffect(isLandscape = uiState.isLandscape)
 
     LifecycleEventEffect(Lifecycle.Event.ON_PAUSE) {
@@ -112,7 +106,7 @@ fun ViewerScreen(
                 ViewerErrorState(
                     title = content.title,
                     message = content.message,
-                    onRetry = { activity?.let { viewModel.reloadDocument(it) } },
+                    onRetry = viewModel::loadDocument,
                     onBack = onNavigateBack
                 )
             }
@@ -130,29 +124,22 @@ fun ViewerScreen(
                 )
             }
 
-            is ViewerContentState.DocReady -> {
-                DocViewerContent(
-                    totalPages = content.totalPages,
-                    initialPage = content.initialPage,
-                    isImmersive = uiState.isImmersive,
-                    renderedPages = content.renderedPages,
-                    pageAspectRatios = content.pageAspectRatios,
-                    onPageChanged = viewModel::onPageChanged,
-                    onViewportWidthChanged = viewModel::onViewportWidthChanged,
-                    onToggleImmersive = viewModel::toggleImmersiveMode
-                )
-            }
-
-            is ViewerContentState.PptReady -> {
-                PptViewerContent(
-                    totalSlides = content.totalSlides,
-                    initialSlide = content.initialSlide,
-                    isImmersive = uiState.isImmersive,
-                    renderedSlides = content.renderedSlides,
-                    onSlideChanged = viewModel::onPageChanged,
-                    onViewportWidthChanged = viewModel::onViewportWidthChanged,
-                    onToggleImmersive = viewModel::toggleImmersiveMode
-                )
+            is ViewerContentState.CollaboraReady -> {
+                if (content.isPresentation) {
+                    PptViewerContent(
+                        tempFile = content.tempFile,
+                        isImmersive = uiState.isImmersive,
+                        onNavigateBack = onNavigateBack,
+                        onError = viewModel::onCollaboraError
+                    )
+                } else {
+                    DocViewerContent(
+                        tempFile = content.tempFile,
+                        isImmersive = uiState.isImmersive,
+                        onNavigateBack = onNavigateBack,
+                        onError = viewModel::onCollaboraError
+                    )
+                }
             }
         }
 
@@ -184,7 +171,7 @@ fun ViewerScreen(
                     }
                 },
                 actions = {
-                    when (uiState.contentState) {
+                    when (val content = uiState.contentState) {
                         is ViewerContentState.PdfReady -> {
                             IconButton(onClick = viewModel::togglePdfReadingMode) {
                                 Icon(
@@ -215,41 +202,41 @@ fun ViewerScreen(
                             }
                         }
 
-                        is ViewerContentState.DocReady -> {
-                            IconButton(onClick = viewModel::toggleLandscape) {
-                                Icon(
-                                    imageVector = Icons.Rounded.ScreenRotation,
-                                    contentDescription = "Toggle horizontal screen",
-                                    tint = if (uiState.isLandscape) {
-                                        MaterialTheme.colorScheme.primary
-                                    } else {
-                                        MaterialTheme.colorScheme.onSurface
-                                    }
-                                )
-                            }
-                            IconButton(onClick = viewModel::toggleImmersiveMode) {
-                                Icon(
-                                    imageVector = Icons.Rounded.Fullscreen,
-                                    contentDescription = "Full screen"
-                                )
-                            }
-                        }
-
-                        is ViewerContentState.PptReady -> {
-                            IconButton(onClick = viewModel::toggleFullscreenHorizontal) {
-                                Icon(
-                                    imageVector = if (uiState.isLandscape) {
-                                        Icons.Rounded.FullscreenExit
-                                    } else {
-                                        Icons.Rounded.Fullscreen
-                                    },
-                                    contentDescription = "Full-screen horizontal presentation",
-                                    tint = if (uiState.isLandscape) {
-                                        MaterialTheme.colorScheme.primary
-                                    } else {
-                                        MaterialTheme.colorScheme.onSurface
-                                    }
-                                )
+                        is ViewerContentState.CollaboraReady -> {
+                            if (content.isPresentation) {
+                                IconButton(onClick = viewModel::toggleFullscreenHorizontal) {
+                                    Icon(
+                                        imageVector = if (uiState.isLandscape) {
+                                            Icons.Rounded.FullscreenExit
+                                        } else {
+                                            Icons.Rounded.Fullscreen
+                                        },
+                                        contentDescription = "Full-screen horizontal presentation",
+                                        tint = if (uiState.isLandscape) {
+                                            MaterialTheme.colorScheme.primary
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurface
+                                        }
+                                    )
+                                }
+                            } else {
+                                IconButton(onClick = viewModel::toggleLandscape) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.ScreenRotation,
+                                        contentDescription = "Toggle horizontal screen",
+                                        tint = if (uiState.isLandscape) {
+                                            MaterialTheme.colorScheme.primary
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurface
+                                        }
+                                    )
+                                }
+                                IconButton(onClick = viewModel::toggleImmersiveMode) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Fullscreen,
+                                        contentDescription = "Full screen"
+                                    )
+                                }
                             }
                         }
 
@@ -262,10 +249,11 @@ fun ViewerScreen(
             )
         }
 
-        // Overlay Bottom Page / Slide Counter Pill
+        // Overlay Bottom Page Counter Pill (for PDF)
         AnimatedVisibility(
-            visible = !uiState.isImmersive && uiState.totalPages > 0 &&
-                uiState.contentState !is ViewerContentState.Error,
+            visible = !uiState.isImmersive &&
+                uiState.contentState is ViewerContentState.PdfReady &&
+                uiState.totalPages > 0,
             enter = fadeIn() + slideInVertically { it },
             exit = fadeOut() + slideOutVertically { it },
             modifier = Modifier
@@ -273,18 +261,7 @@ fun ViewerScreen(
                 .navigationBarsPadding()
                 .padding(bottom = 14.dp)
         ) {
-            val unitLabel = if (uiState.contentState is ViewerContentState.PptReady) {
-                "Slide"
-            } else {
-                "Page"
-            }
             val displayPage = (uiState.currentPage + 1).coerceIn(1, uiState.totalPages)
-            val modeTag = if (uiState.contentState is ViewerContentState.PdfReady) {
-                " · ${uiState.pdfReadingMode.label}"
-            } else {
-                ""
-            }
-
             Surface(
                 shape = RoundedCornerShape(20.dp),
                 color = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f),
@@ -302,7 +279,7 @@ fun ViewerScreen(
                         tint = MaterialTheme.colorScheme.primary
                     )
                     Text(
-                        text = "$unitLabel $displayPage of ${uiState.totalPages}$modeTag",
+                        text = "Page $displayPage of ${uiState.totalPages} · ${uiState.pdfReadingMode.label}",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurface
                     )

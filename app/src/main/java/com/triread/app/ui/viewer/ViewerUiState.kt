@@ -2,6 +2,7 @@ package com.triread.app.ui.viewer
 
 import android.graphics.Bitmap
 import com.triread.app.domain.model.DocumentItem
+import java.io.File
 
 enum class PdfReadingMode(val label: String) {
     VERTICAL_SCROLL("Vertical Scroll"),
@@ -17,18 +18,9 @@ sealed interface ViewerContentState {
         val renderedPages: Map<Int, Bitmap>
     ) : ViewerContentState
 
-    data class DocReady(
-        val totalPages: Int,
-        val initialPage: Int,
-        val renderedPages: Map<Int, Bitmap>,
-        val pageAspectRatios: Map<Int, Float>
-    ) : ViewerContentState
-
-    data class PptReady(
-        val totalSlides: Int,
-        val initialSlide: Int,
-        val renderedSlides: Map<Int, Bitmap>,
-        val slideAspectRatios: Map<Int, Float>
+    data class CollaboraReady(
+        val tempFile: File,
+        val isPresentation: Boolean
     ) : ViewerContentState
 
     data class Error(

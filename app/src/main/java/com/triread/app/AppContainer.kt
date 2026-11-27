@@ -1,8 +1,8 @@
 package com.triread.app
 
 import android.content.Context
+import com.triread.app.data.collabora.CollaboraTempFileManager
 import com.triread.app.data.local.AppDatabase
-import com.triread.app.data.lokit.LOKitEngine
 import com.triread.app.data.repository.DocumentRepositoryImpl
 import com.triread.app.data.scanner.MediaStoreDocumentScanner
 import com.triread.app.data.scanner.ThumbnailGenerator
@@ -25,8 +25,8 @@ class AppContainer(context: Context) {
         ThumbnailGenerator(appContext)
     }
 
-    val loKitEngine: LOKitEngine by lazy {
-        LOKitEngine(appContext)
+    val collaboraTempFileManager: CollaboraTempFileManager by lazy {
+        CollaboraTempFileManager(appContext)
     }
 
     val appUpdateManager: AppUpdateManager by lazy {

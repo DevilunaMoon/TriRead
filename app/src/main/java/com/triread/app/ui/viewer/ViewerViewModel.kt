@@ -1,21 +1,17 @@
 package com.triread.app.ui.viewer
 
-import android.app.Activity
 import android.content.Context
 import android.graphics.Bitmap
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
-import com.triread.app.data.lokit.LOKitDocumentSession
-import com.triread.app.data.lokit.LOKitEngine
-import com.triread.app.data.lokit.LOKitPasswordProtectedException
+import com.triread.app.data.collabora.CollaboraTempFileManager
 import com.triread.app.data.parser.PdfDocumentSession
 import com.triread.app.data.parser.PdfPasswordProtectedException
 import com.triread.app.domain.model.DocumentCategory
 import com.triread.app.domain.model.DocumentItem
 import com.triread.app.domain.repository.DocumentRepository
 import com.triread.app.util.IoExtensions.safeRecycle
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
@@ -25,12 +21,13 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 
 class ViewerViewModel(
     private val uriString: String,
     private val appContext: Context,
     private val repository: DocumentRepository,
-    private val loKitEngine: LOKitEngine
+    private val tempFileManager: CollaboraTempFileManager
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(ViewerUiState())
@@ -39,25 +36,15 @@ class ViewerViewModel(
     private var pdfSession: PdfDocumentSession? = null
     private val pdfBitmapCache = LinkedHashMap<Int, Bitmap>()
     private var pdfRenderJob: Job? = null
-
-    private var lokSession: LOKitDocumentSession? = null
-    private val lokBitmapCache = LinkedHashMap<Int, Bitmap>()
-    private var lokRenderJob: Job? = null
-
     private var lastRenderWidthPx: Int = DEFAULT_RENDER_WIDTH_PX
-    private var hasStartedInitialLoad = false
 
-    fun loadDocumentIfNeeded(activity: Activity) {
-        if (hasStartedInitialLoad) return
-        hasStartedInitialLoad = true
-        loadDocument(activity)
+    private var activeTempFile: File? = null
+
+    init {
+        loadDocument()
     }
 
-    fun reloadDocument(activity: Activity) {
-        loadDocument(activity)
-    }
-
-    private fun loadDocument(activity: Activity) {
+    fun loadDocument() {
         viewModelScope.launch {
             _uiState.update { it.copy(contentState = ViewerContentState.Loading) }
 
@@ -85,7 +72,7 @@ class ViewerViewModel(
             when (document.category) {
                 DocumentCategory.PDF -> openPdf(document)
                 DocumentCategory.DOC,
-                DocumentCategory.PPT -> openWithLOKit(activity, document)
+                DocumentCategory.PPT -> openWithCollabora(document)
             }
         }
     }
@@ -140,85 +127,60 @@ class ViewerViewModel(
         )
     }
 
-    private suspend fun openWithLOKit(activity: Activity, document: DocumentItem) {
-        closeLokSession()
+    private suspend fun openWithCollabora(document: DocumentItem) {
+        cleanupTempFile()
 
-        LOKitDocumentSession.open(
-            activity = activity,
-            context = appContext,
-            engine = loKitEngine,
+        tempFileManager.copyUriToTempFile(
             uriString = document.uriString,
             fileName = document.title,
             category = document.category
         ).fold(
             onFailure = { error ->
-                val (title, message) = when (error) {
-                    is LOKitPasswordProtectedException ->
-                        "Password-Protected File" to "Encrypted documents are not supported yet."
-                    is SecurityException ->
-                        "Permission Revoked" to "Please re-open this file using the file picker to grant access."
-                    else ->
-                        "Unable to Open Document" to (error.localizedMessage ?: "The file may be corrupted or unsupported.")
-                }
-                _uiState.update {
-                    it.copy(contentState = ViewerContentState.Error(title = title, message = message))
-                }
-            },
-            onSuccess = { session ->
-                lokSession = session
-                val total = session.pageCount
-                if (total <= 0) {
-                    _uiState.update {
-                        it.copy(
-                            contentState = ViewerContentState.Error(
-                                title = "Empty Document",
-                                message = "This file contains no renderable pages."
-                            )
-                        )
-                    }
-                    return
-                }
-
-                val restoredPage = document.currentPage.coerceIn(0, total - 1)
-                val aspectMap = (0 until total).associateWith { idx -> session.pageAspectRatio(idx) }
-
-                val readyState = if (document.category == DocumentCategory.PPT) {
-                    ViewerContentState.PptReady(
-                        totalSlides = total,
-                        initialSlide = restoredPage,
-                        renderedSlides = emptyMap(),
-                        slideAspectRatios = aspectMap
-                    )
-                } else {
-                    ViewerContentState.DocReady(
-                        totalPages = total,
-                        initialPage = restoredPage,
-                        renderedPages = emptyMap(),
-                        pageAspectRatios = aspectMap
-                    )
-                }
-
+                val title = if (error is SecurityException) "Permission Revoked" else "Unable to Open Document"
                 _uiState.update {
                     it.copy(
-                        currentPage = restoredPage,
-                        totalPages = total,
-                        contentState = readyState
+                        contentState = ViewerContentState.Error(
+                            title = title,
+                            message = error.localizedMessage ?: "The file could not be read."
+                        )
                     )
                 }
-                persistProgressAsync(restoredPage, total)
-                updateLokWindow(restoredPage, lastRenderWidthPx)
+            },
+            onSuccess = { tempFile ->
+                activeTempFile = tempFile
+                _uiState.update {
+                    it.copy(
+                        contentState = ViewerContentState.CollaboraReady(
+                            tempFile = tempFile,
+                            isPresentation = document.category == DocumentCategory.PPT
+                        )
+                    )
+                }
+                repository.updateReadingProgress(
+                    uriString = uriString,
+                    currentPage = document.currentPage,
+                    totalPages = document.totalPages
+                )
             }
         )
+    }
+
+    fun onCollaboraError(message: String) {
+        _uiState.update {
+            it.copy(
+                contentState = ViewerContentState.Error(
+                    title = "Unable to Open Document",
+                    message = message
+                )
+            )
+        }
     }
 
     fun onViewportWidthChanged(widthPx: Int) {
         if (widthPx > 0 && kotlin.math.abs(widthPx - lastRenderWidthPx) > 120) {
             lastRenderWidthPx = widthPx
-            when (_uiState.value.contentState) {
-                is ViewerContentState.PdfReady -> updatePdfWindow(_uiState.value.currentPage, widthPx)
-                is ViewerContentState.DocReady,
-                is ViewerContentState.PptReady -> updateLokWindow(_uiState.value.currentPage, widthPx)
-                else -> Unit
+            if (_uiState.value.contentState is ViewerContentState.PdfReady) {
+                updatePdfWindow(_uiState.value.currentPage, widthPx)
             }
         }
     }
@@ -234,11 +196,8 @@ class ViewerViewModel(
         _uiState.update { it.copy(currentPage = clamped) }
         persistProgressAsync(clamped, total)
 
-        when (state.contentState) {
-            is ViewerContentState.PdfReady -> updatePdfWindow(clamped, lastRenderWidthPx)
-            is ViewerContentState.DocReady,
-            is ViewerContentState.PptReady -> updateLokWindow(clamped, lastRenderWidthPx)
-            else -> Unit
+        if (state.contentState is ViewerContentState.PdfReady) {
+            updatePdfWindow(clamped, lastRenderWidthPx)
         }
     }
 
@@ -350,51 +309,6 @@ class ViewerViewModel(
         }
     }
 
-    private fun updateLokWindow(centerPage: Int, renderWidthPx: Int) {
-        val session = lokSession ?: return
-        val total = session.pageCount
-        if (total <= 0) return
-
-        // Strict visible page +/- 1 buffer to keep LOKit memory lean
-        val radius = 1
-
-        lokRenderJob?.cancel()
-        lokRenderJob = viewModelScope.launch {
-            val window = ((centerPage - radius).coerceAtLeast(0)..(centerPage + radius).coerceAtMost(total - 1))
-                .toSet()
-
-            val renderOrder = listOf(centerPage, centerPage + 1, centerPage - 1)
-                .filter { it in window }
-
-            val evicted = mutableListOf<Bitmap>()
-            val iterator = lokBitmapCache.entries.iterator()
-            while (iterator.hasNext()) {
-                val entry = iterator.next()
-                if (entry.key !in window) {
-                    evicted.add(entry.value)
-                    iterator.remove()
-                }
-            }
-            if (evicted.isNotEmpty()) {
-                publishLokCache()
-                delay(60L)
-                evicted.forEach { it.safeRecycle() }
-            }
-
-            for (pageIndex in renderOrder) {
-                if (lokBitmapCache.containsKey(pageIndex)) continue
-                session.renderPage(pageIndex, renderWidthPx).onSuccess { bitmap ->
-                    if (pageIndex in window) {
-                        lokBitmapCache[pageIndex] = bitmap
-                        publishLokCache()
-                    } else {
-                        bitmap.safeRecycle()
-                    }
-                }
-            }
-        }
-    }
-
     private fun publishPdfCache() {
         val snapshot = pdfBitmapCache.toMap()
         _uiState.update { state ->
@@ -403,19 +317,6 @@ class ViewerViewModel(
                 state.copy(contentState = current.copy(renderedPages = snapshot))
             } else {
                 state
-            }
-        }
-    }
-
-    private fun publishLokCache() {
-        val snapshot = lokBitmapCache.toMap()
-        _uiState.update { state ->
-            when (val current = state.contentState) {
-                is ViewerContentState.DocReady ->
-                    state.copy(contentState = current.copy(renderedPages = snapshot))
-                is ViewerContentState.PptReady ->
-                    state.copy(contentState = current.copy(renderedSlides = snapshot))
-                else -> state
             }
         }
     }
@@ -438,23 +339,15 @@ class ViewerViewModel(
         pdfSession = null
     }
 
-    private fun closeLokSession() {
-        lokRenderJob?.cancel()
-        lokBitmapCache.values.forEach { it.safeRecycle() }
-        lokBitmapCache.clear()
-        val sessionToClose = lokSession
-        lokSession = null
-        if (sessionToClose != null) {
-            CoroutineScope(loKitEngine.lokDispatcher).launch {
-                sessionToClose.close()
-            }
-        }
+    private fun cleanupTempFile() {
+        tempFileManager.deleteTempFile(activeTempFile)
+        activeTempFile = null
     }
 
     override fun onCleared() {
         super.onCleared()
         closePdfSession()
-        closeLokSession()
+        cleanupTempFile()
     }
 
     companion object {
@@ -464,7 +357,7 @@ class ViewerViewModel(
             uriString: String,
             appContext: Context,
             repository: DocumentRepository,
-            loKitEngine: LOKitEngine
+            tempFileManager: CollaboraTempFileManager
         ): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T {
@@ -475,7 +368,7 @@ class ViewerViewModel(
                     uriString = uriString,
                     appContext = appContext.applicationContext,
                     repository = repository,
-                    loKitEngine = loKitEngine
+                    tempFileManager = tempFileManager
                 ) as T
             }
         }
