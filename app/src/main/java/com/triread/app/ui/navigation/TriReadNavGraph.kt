@@ -3,6 +3,10 @@ package com.triread.app.ui.navigation
 import android.net.Uri
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
@@ -33,6 +37,7 @@ fun TriReadNavGraph(
     onInitialDocumentConsumed: () -> Unit = {}
 ) {
     val navController = rememberNavController()
+    var hasCheckedStartupUpdate by rememberSaveable { mutableStateOf(false) }
 
     LaunchedEffect(initialDocumentUri) {
         if (!initialDocumentUri.isNullOrBlank()) {
@@ -40,6 +45,23 @@ fun TriReadNavGraph(
                 launchSingleTop = true
             }
             onInitialDocumentConsumed()
+        }
+    }
+
+    // Mihon-style silent startup check: if online and a newer GitHub Release exists,
+    // automatically open the Update screen (skipping if launched directly into a document).
+    LaunchedEffect(Unit) {
+        if (!hasCheckedStartupUpdate && initialDocumentUri.isNullOrBlank()) {
+            hasCheckedStartupUpdate = true
+            container.appUpdateManager.checkForUpdate().onSuccess { info ->
+                if (info.isUpdateAvailable &&
+                    navController.currentDestination?.route == TriReadRoutes.DASHBOARD
+                ) {
+                    navController.navigate(TriReadRoutes.UPDATE) {
+                        launchSingleTop = true
+                    }
+                }
+            }
         }
     }
 
