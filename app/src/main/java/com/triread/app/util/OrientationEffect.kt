@@ -27,3 +27,4 @@ fun LockLandscapeEffect(isLandscape: Boolean) {
         }
     }
 }
+
