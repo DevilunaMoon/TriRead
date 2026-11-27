@@ -3,12 +3,13 @@ package com.triread.app.ui.viewer
 import android.graphics.Bitmap
 import androidx.compose.ui.graphics.Color
 import com.triread.app.data.parser.DocBlock
+import com.triread.app.data.parser.DocPageMetrics
 import com.triread.app.data.parser.SlideItem
 import com.triread.app.domain.model.DocumentItem
 
 enum class PdfReadingMode(val label: String) {
     VERTICAL_SCROLL("Vertical Scroll"),
-    HORIZONTAL_PAGED("Horizontal Tap")
+    HORIZONTAL_PAGED("Single Page")
 }
 
 enum class ReaderTheme(
@@ -60,6 +61,9 @@ sealed interface ViewerContentState {
     data class DocReady(
         val blocks: List<DocBlock>,
         val initialBlockIndex: Int,
+        val pageMetrics: DocPageMetrics = DocPageMetrics(),
+        val headerText: String? = null,
+        val footerText: String? = null,
         val noticeMessage: String? = null
     ) : ViewerContentState
 

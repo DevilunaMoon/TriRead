@@ -131,6 +131,9 @@ fun ViewerScreen(
                 DocViewerContent(
                     blocks = content.blocks,
                     initialBlockIndex = content.initialBlockIndex,
+                    pageMetrics = content.pageMetrics,
+                    headerText = content.headerText,
+                    footerText = content.footerText,
                     noticeMessage = content.noticeMessage,
                     settings = uiState.typographySettings,
                     isImmersive = uiState.isImmersive,
@@ -205,10 +208,10 @@ fun ViewerScreen(
                                     }
                                 )
                             }
-                            IconButton(onClick = viewModel::toggleImmersiveMode) {
+                            IconButton(onClick = viewModel::togglePdfPerPageFullscreen) {
                                 Icon(
                                     imageVector = Icons.Rounded.Fullscreen,
-                                    contentDescription = "Full screen"
+                                    contentDescription = "Full-screen single page"
                                 )
                             }
                         }

@@ -69,6 +69,7 @@ fun PdfViewerContent(
         PdfReadingMode.HORIZONTAL_PAGED -> PdfHorizontalPagedContent(
             totalPages = totalPages,
             initialPage = currentPage,
+            isImmersive = isImmersive,
             renderedPages = renderedPages,
             onPageChanged = onPageChanged,
             onViewportWidthChanged = onViewportWidthChanged,
@@ -194,6 +195,7 @@ private fun PdfVerticalScrollContent(
 private fun PdfHorizontalPagedContent(
     totalPages: Int,
     initialPage: Int,
+    isImmersive: Boolean,
     renderedPages: Map<Int, Bitmap>,
     onPageChanged: (Int) -> Unit,
     onViewportWidthChanged: (Int) -> Unit,
@@ -284,7 +286,10 @@ private fun PdfHorizontalPagedContent(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 4.dp, vertical = 8.dp),
+                .padding(
+                    horizontal = if (isImmersive) 0.dp else 4.dp,
+                    vertical = if (isImmersive) 0.dp else 8.dp
+                ),
             contentAlignment = Alignment.Center
         ) {
             if (bitmap != null && !bitmap.isRecycled) {

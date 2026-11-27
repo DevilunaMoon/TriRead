@@ -154,6 +154,9 @@ class ViewerViewModel(
                         contentState = ViewerContentState.DocReady(
                             blocks = parsed.blocks,
                             initialBlockIndex = initialBlock,
+                            pageMetrics = parsed.pageMetrics,
+                            headerText = parsed.headerText,
+                            footerText = parsed.footerText,
                             noticeMessage = parsed.noticeMessage
                         )
                     )
@@ -278,6 +281,20 @@ class ViewerViewModel(
                 PdfReadingMode.VERTICAL_SCROLL
             }
             state.copy(pdfReadingMode = nextMode)
+        }
+        if (_uiState.value.contentState is ViewerContentState.PdfReady) {
+            updatePdfWindow(_uiState.value.currentPage, lastRenderWidthPx)
+        }
+    }
+
+    fun togglePdfPerPageFullscreen() {
+        _uiState.update { state ->
+            val entering = !(state.isImmersive && state.pdfReadingMode == PdfReadingMode.HORIZONTAL_PAGED)
+            state.copy(
+                pdfReadingMode = if (entering) PdfReadingMode.HORIZONTAL_PAGED else PdfReadingMode.VERTICAL_SCROLL,
+                isImmersive = entering,
+                showSettingsSheet = false
+            )
         }
         if (_uiState.value.contentState is ViewerContentState.PdfReady) {
             updatePdfWindow(_uiState.value.currentPage, lastRenderWidthPx)

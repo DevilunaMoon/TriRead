@@ -6,10 +6,12 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -48,15 +50,23 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.triread.app.data.parser.DocBlock
+import com.triread.app.data.parser.DocPageMetrics
+import com.triread.app.data.parser.DocRun
 import com.triread.app.data.parser.DocTextAlignment
 import com.triread.app.ui.viewer.ReaderTheme
 import com.triread.app.ui.viewer.ReaderTypographySettings
@@ -68,6 +78,9 @@ import java.util.Locale
 fun DocViewerContent(
     blocks: List<DocBlock>,
     initialBlockIndex: Int,
+    pageMetrics: DocPageMetrics,
+    headerText: String?,
+    footerText: String?,
     noticeMessage: String?,
     settings: ReaderTypographySettings,
     isImmersive: Boolean,
@@ -79,6 +92,9 @@ fun DocViewerContent(
     if (settings.isPrintLayout) {
         DocPrintLayoutContent(
             blocks = blocks,
+            pageMetrics = pageMetrics,
+            headerText = headerText,
+            footerText = footerText,
             noticeMessage = noticeMessage,
             isImmersive = isImmersive,
             onPrintPageChanged = onPrintPageChanged,
@@ -152,7 +168,7 @@ private fun DocReflowableContent(
             items = blocks,
             key = { index, _ -> index }
         ) { _, block ->
-            DocBlockItem(
+            ReflowableDocBlock(
                 block = block,
                 textColor = theme.textColor,
                 surfaceColor = theme.surfaceColor,
@@ -167,13 +183,16 @@ private fun DocReflowableContent(
 @Composable
 private fun DocPrintLayoutContent(
     blocks: List<DocBlock>,
+    pageMetrics: DocPageMetrics,
+    headerText: String?,
+    footerText: String?,
     noticeMessage: String?,
     isImmersive: Boolean,
     onPrintPageChanged: (Int, Int) -> Unit,
     onToggleImmersive: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val pages = remember(blocks) { paginateBlocksForPrint(blocks) }
+    val pages = remember(blocks, pageMetrics) { paginateBlocksForLiteralPrint(blocks, pageMetrics) }
     val listState = rememberLazyListState()
 
     var zoomScale by remember { mutableFloatStateOf(1f) }
@@ -191,7 +210,7 @@ private fun DocPrintLayoutContent(
     Box(
         modifier = modifier
             .fillMaxSize()
-            .background(Color(0xFFDDE1E7))
+            .background(Color(0xFFD6DAE2))
             .onSizeChanged { containerSize = it }
             .pointerInput(Unit) {
                 detectTapGestures(
@@ -201,14 +220,14 @@ private fun DocPrintLayoutContent(
                             zoomScale = 1f
                             panOffset = Offset.Zero
                         } else {
-                            zoomScale = 1.8f
+                            zoomScale = 2.0f
                         }
                     }
                 )
             }
             .pointerInput(Unit) {
                 detectTransformGestures { _, pan, zoom, _ ->
-                    val nextScale = (zoomScale * zoom).coerceIn(1f, 3f)
+                    val nextScale = (zoomScale * zoom).coerceIn(1f, 4f)
                     zoomScale = nextScale
                     if (nextScale <= 1.02f) {
                         panOffset = Offset.Zero
@@ -235,12 +254,12 @@ private fun DocPrintLayoutContent(
                     translationY = panOffset.y
                 },
             contentPadding = PaddingValues(
-                start = 12.dp,
-                end = 12.dp,
-                top = if (isImmersive) 14.dp else 96.dp,
-                bottom = if (isImmersive) 20.dp else 88.dp
+                start = 10.dp,
+                end = 10.dp,
+                top = if (isImmersive) 10.dp else 92.dp,
+                bottom = if (isImmersive) 16.dp else 88.dp
             ),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
+            verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             if (!noticeMessage.isNullOrBlank()) {
                 item(key = "print_notice") {
@@ -253,48 +272,187 @@ private fun DocPrintLayoutContent(
             }
 
             itemsIndexed(items = pages, key = { idx, _ -> "print_page_$idx" }) { pageIdx, pageBlocks ->
-                Surface(
-                    shape = RoundedCornerShape(4.dp),
-                    color = Color.White,
-                    shadowElevation = 4.dp,
-                    border = BorderStroke(0.5.dp, Color(0xFFCBD5E1)),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 480.dp)
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 24.dp, vertical = 26.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        pageBlocks.forEach { block ->
-                            DocBlockItem(
-                                block = block,
-                                textColor = Color(0xFF111827),
-                                surfaceColor = Color(0xFFF8FAFC),
-                                mutedColor = Color(0xFF64748B),
-                                fontSizeSp = 12.5f,
-                                lineHeightMultiplier = 1.45f
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(12.dp))
-                        Text(
-                            text = "${pageIdx + 1}",
-                            fontSize = 10.sp,
-                            color = Color(0xFF94A3B8),
-                            textAlign = TextAlign.Center,
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                    }
-                }
+                LiteralPrintPageSheet(
+                    pageIndex = pageIdx,
+                    pageBlocks = pageBlocks,
+                    pageMetrics = pageMetrics,
+                    headerText = headerText,
+                    footerText = footerText
+                )
             }
         }
     }
 }
 
 @Composable
-private fun DocBlockItem(
+private fun LiteralPrintPageSheet(
+    pageIndex: Int,
+    pageBlocks: List<DocBlock>,
+    pageMetrics: DocPageMetrics,
+    headerText: String?,
+    footerText: String?
+) {
+    val context = LocalContext.current
+    val fontScale = LocalDensity.current.fontScale.coerceAtLeast(0.5f)
+
+    Surface(
+        shape = RoundedCornerShape(2.dp),
+        color = Color.White,
+        shadowElevation = 4.dp,
+        border = BorderStroke(0.5.dp, Color(0xFFCBD5E1)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .aspectRatio(pageMetrics.aspectRatio)
+    ) {
+        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+            // Exact proportional point-to-dp scale for literal Word page geometry
+            val ptScale = maxWidth.value / pageMetrics.widthPt.coerceAtLeast(300f)
+
+            val padLeft = (pageMetrics.marginLeftPt * ptScale).dp
+            val padRight = (pageMetrics.marginRightPt * ptScale).dp
+            val padTop = (pageMetrics.marginTopPt * ptScale).dp
+            val padBottom = (pageMetrics.marginBottomPt * ptScale).dp
+
+            if (!headerText.isNullOrBlank()) {
+                val hdrSp = ((9f * ptScale) / fontScale).coerceIn(5.5f, 12f)
+                Text(
+                    text = headerText,
+                    color = Color(0xFF64748B),
+                    fontSize = hdrSp.sp,
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(
+                            start = padLeft,
+                            end = padRight,
+                            top = (padTop * 0.4f).coerceAtLeast(6.dp)
+                        )
+                )
+            }
+
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(start = padLeft, end = padRight, top = padTop, bottom = padBottom)
+            ) {
+                pageBlocks.forEach { block ->
+                    when (block) {
+                        is DocBlock.Heading -> {
+                            val defaultPt = when (block.level) {
+                                1 -> 16f
+                                2 -> 13.5f
+                                else -> 12f
+                            }
+                            val annotated = buildRunsAnnotatedString(
+                                runs = block.runs,
+                                defaultFontSizePt = defaultPt,
+                                forceBold = true,
+                                defaultColor = Color(0xFF111827),
+                                ptScale = ptScale,
+                                fontScale = fontScale
+                            )
+                            val lineSp = ((defaultPt * 1.25f * ptScale) / fontScale).coerceIn(7f, 28f)
+                            Text(
+                                text = annotated,
+                                lineHeight = lineSp.sp,
+                                textAlign = block.alignment.toComposeTextAlign(),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(
+                                        top = (block.spaceBeforePt * ptScale).dp,
+                                        bottom = (block.spaceAfterPt * ptScale).dp
+                                    )
+                            )
+                        }
+
+                        is DocBlock.Paragraph -> {
+                            val defaultPt = 11f
+                            val prefix = if (block.isBullet) "•  " else ""
+                            val annotated = buildRunsAnnotatedString(
+                                runs = block.runs,
+                                prefix = prefix,
+                                defaultFontSizePt = defaultPt,
+                                forceBold = false,
+                                defaultColor = Color(0xFF111827),
+                                ptScale = ptScale,
+                                fontScale = fontScale
+                            )
+                            val maxRunPt = block.runs.maxOfOrNull { it.fontSizePt ?: defaultPt } ?: defaultPt
+                            val lineSp = ((maxRunPt * 1.22f * ptScale) / fontScale).coerceIn(6.5f, 24f)
+                            val indentDp = ((block.indentLeftPt + if (block.isBullet) 14f else 0f) * ptScale).dp
+
+                            Text(
+                                text = annotated,
+                                lineHeight = lineSp.sp,
+                                textAlign = block.alignment.toComposeTextAlign(),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(
+                                        start = indentDp,
+                                        top = (block.spaceBeforePt * ptScale).dp,
+                                        bottom = (block.spaceAfterPt * ptScale).dp
+                                    )
+                            )
+                        }
+
+                        is DocBlock.ImageBlock -> {
+                            AsyncImage(
+                                model = ImageRequest.Builder(context)
+                                    .data(File(block.imagePath))
+                                    .crossfade(false)
+                                    .build(),
+                                contentDescription = "Document image",
+                                contentScale = ContentScale.Fit,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = (180f * ptScale).dp.coerceAtLeast(64.dp))
+                                    .padding(vertical = (4f * ptScale).dp)
+                            )
+                        }
+
+                        is DocBlock.TableRow -> {
+                            val cellSp = ((10f * ptScale) / fontScale).coerceIn(5.5f, 14f)
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(Color(0xFFF8FAFC))
+                                    .padding((3f * ptScale).dp),
+                                horizontalArrangement = Arrangement.spacedBy((4f * ptScale).dp)
+                            ) {
+                                block.cells.forEach { cell ->
+                                    Text(
+                                        text = cell,
+                                        color = Color(0xFF111827),
+                                        fontSize = cellSp.sp,
+                                        lineHeight = (cellSp * 1.15f).sp,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                            }
+                            HorizontalDivider(color = Color(0xFFCBD5E1), thickness = 0.5.dp)
+                        }
+
+                        DocBlock.PageBreak -> Unit
+                    }
+                }
+            }
+
+            val ftrSp = ((9f * ptScale) / fontScale).coerceIn(5.5f, 12f)
+            Text(
+                text = footerText?.takeIf { it.isNotBlank() } ?: "${pageIndex + 1}",
+                color = Color(0xFF94A3B8),
+                fontSize = ftrSp.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .padding(bottom = (padBottom * 0.35f).coerceAtLeast(6.dp))
+            )
+        }
+    }
+}
+
+@Composable
+private fun ReflowableDocBlock(
     block: DocBlock,
     textColor: Color,
     surfaceColor: Color,
@@ -311,13 +469,16 @@ private fun DocBlockItem(
                 2 -> 1.24f
                 else -> 1.12f
             }
-            val size = (fontSizeSp * headingScale).sp
+            val size = (fontSizeSp * headingScale)
+            val annotated = buildReflowableAnnotatedString(
+                runs = block.runs,
+                defaultColor = textColor,
+                forceBold = true
+            )
             Text(
-                text = block.text,
-                color = textColor,
-                fontSize = size,
-                lineHeight = size * 1.25f,
-                fontWeight = FontWeight.Bold,
+                text = annotated,
+                fontSize = size.sp,
+                lineHeight = (size * 1.25f).sp,
                 textAlign = block.alignment.toComposeTextAlign(),
                 modifier = Modifier
                     .fillMaxWidth()
@@ -327,13 +488,16 @@ private fun DocBlockItem(
 
         is DocBlock.Paragraph -> {
             val prefix = if (block.isBullet) "•  " else ""
+            val annotated = buildReflowableAnnotatedString(
+                runs = block.runs,
+                prefix = prefix,
+                defaultColor = textColor,
+                forceBold = false
+            )
             Text(
-                text = "$prefix${block.text}",
-                color = textColor,
+                text = annotated,
                 fontSize = fontSizeSp.sp,
                 lineHeight = (fontSizeSp * lineHeightMultiplier).sp,
-                fontWeight = if (block.isBold) FontWeight.SemiBold else FontWeight.Normal,
-                fontStyle = if (block.isItalic) FontStyle.Italic else FontStyle.Normal,
                 textAlign = block.alignment.toComposeTextAlign(),
                 modifier = Modifier
                     .fillMaxWidth()
@@ -391,6 +555,63 @@ private fun DocBlockItem(
     }
 }
 
+private fun buildRunsAnnotatedString(
+    runs: List<DocRun>,
+    prefix: String = "",
+    defaultFontSizePt: Float,
+    forceBold: Boolean,
+    defaultColor: Color,
+    ptScale: Float,
+    fontScale: Float
+): AnnotatedString = buildAnnotatedString {
+    if (prefix.isNotEmpty()) {
+        val sp = ((defaultFontSizePt * ptScale) / fontScale).coerceIn(5.5f, 28f)
+        withStyle(SpanStyle(color = defaultColor, fontSize = sp.sp)) {
+            append(prefix)
+        }
+    }
+    runs.forEach { run ->
+        val pt = run.fontSizePt ?: defaultFontSizePt
+        val sp = ((pt * ptScale) / fontScale).coerceIn(5.5f, 28f)
+        withStyle(
+            SpanStyle(
+                color = run.colorArgb?.let { Color(it) } ?: defaultColor,
+                fontSize = sp.sp,
+                fontWeight = if (forceBold || run.isBold) FontWeight.Bold else FontWeight.Normal,
+                fontStyle = if (run.isItalic) FontStyle.Italic else FontStyle.Normal,
+                textDecoration = if (run.isUnderline) TextDecoration.Underline else TextDecoration.None
+            )
+        ) {
+            append(run.text)
+        }
+    }
+}
+
+private fun buildReflowableAnnotatedString(
+    runs: List<DocRun>,
+    prefix: String = "",
+    defaultColor: Color,
+    forceBold: Boolean
+): AnnotatedString = buildAnnotatedString {
+    if (prefix.isNotEmpty()) {
+        withStyle(SpanStyle(color = defaultColor)) {
+            append(prefix)
+        }
+    }
+    runs.forEach { run ->
+        withStyle(
+            SpanStyle(
+                color = defaultColor,
+                fontWeight = if (forceBold || run.isBold) FontWeight.Bold else FontWeight.Normal,
+                fontStyle = if (run.isItalic) FontStyle.Italic else FontStyle.Normal,
+                textDecoration = if (run.isUnderline) TextDecoration.Underline else TextDecoration.None
+            )
+        ) {
+            append(run.text)
+        }
+    }
+}
+
 @Composable
 private fun NoticeCard(
     message: String,
@@ -413,35 +634,48 @@ private fun NoticeCard(
     }
 }
 
-private fun paginateBlocksForPrint(blocks: List<DocBlock>): List<List<DocBlock>> {
+private fun paginateBlocksForLiteralPrint(
+    blocks: List<DocBlock>,
+    metrics: DocPageMetrics
+): List<List<DocBlock>> {
     if (blocks.isEmpty()) return listOf(emptyList())
+    val usableHeightPt = (metrics.heightPt - metrics.marginTopPt - metrics.marginBottomPt).coerceAtLeast(320f)
+    val usableWidthPt = (metrics.widthPt - metrics.marginLeftPt - metrics.marginRightPt).coerceAtLeast(240f)
+    val charsPerLine = (usableWidthPt / 5.8f).coerceAtLeast(40f)
+
     val pages = mutableListOf<List<DocBlock>>()
     val current = mutableListOf<DocBlock>()
-    var weight = 0
+    var usedPt = 0f
 
     for (block in blocks) {
         if (block is DocBlock.PageBreak) {
             if (current.isNotEmpty()) {
                 pages.add(current.toList())
                 current.clear()
-                weight = 0
+                usedPt = 0f
             }
             continue
         }
-        val blockWeight = when (block) {
-            is DocBlock.ImageBlock -> 6
-            is DocBlock.TableRow -> 2
-            is DocBlock.Heading -> 2
-            is DocBlock.Paragraph -> (block.text.length / 110).coerceIn(1, 5)
-            DocBlock.PageBreak -> 0
+        val estimatedPt = when (block) {
+            is DocBlock.Heading -> {
+                val lines = ((block.plainText.length / (charsPerLine * 0.75f)).toInt() + 1).coerceAtLeast(1)
+                block.spaceBeforePt + block.spaceAfterPt + lines * 20f
+            }
+            is DocBlock.Paragraph -> {
+                val lines = ((block.plainText.length / charsPerLine).toInt() + 1).coerceAtLeast(1)
+                block.spaceBeforePt + block.spaceAfterPt + lines * 14.5f
+            }
+            is DocBlock.ImageBlock -> 188f
+            is DocBlock.TableRow -> 26f
+            DocBlock.PageBreak -> 0f
         }
-        if (current.isNotEmpty() && weight + blockWeight > 18) {
+        if (current.isNotEmpty() && usedPt + estimatedPt > usableHeightPt) {
             pages.add(current.toList())
             current.clear()
-            weight = 0
+            usedPt = 0f
         }
         current.add(block)
-        weight += blockWeight
+        usedPt += estimatedPt
     }
     if (current.isNotEmpty()) {
         pages.add(current.toList())
@@ -478,7 +712,6 @@ fun DocSettingsBottomSheet(
                 style = MaterialTheme.typography.titleLarge
             )
 
-            // Print Layout Switch (Slider Button)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -491,7 +724,7 @@ fun DocSettingsBottomSheet(
                     )
                     Text(
                         text = if (settings.isPrintLayout) {
-                            "Showing A4 paper sheets in full vertical view"
+                            "Showing original document page layout"
                         } else {
                             "Showing mobile reflowable vertical view"
                         },

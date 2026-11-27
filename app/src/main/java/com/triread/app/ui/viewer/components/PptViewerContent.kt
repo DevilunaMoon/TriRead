@@ -51,6 +51,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -236,139 +237,148 @@ private fun SlideLayoutCanvas(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val fontScale = LocalDensity.current.fontScale.coerceAtLeast(0.5f)
     val bgColor = slide.backgroundColorArgb?.let { Color(it) } ?: Color.White
 
-    Surface(
-        modifier = modifier
-            .fillMaxWidth()
-            .aspectRatio(aspectRatio),
-        shape = RoundedCornerShape(4.dp),
-        color = bgColor,
-        shadowElevation = 6.dp
+    // Fit slide strictly inside BOTH width and height so neither portrait nor landscape ever crops edges.
+    BoxWithConstraints(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center
     ) {
-        BoxWithConstraints(
-            modifier = Modifier
-                .fillMaxSize()
-                .clipToBounds()
+        val fitWidth = minOf(maxWidth, maxHeight * aspectRatio)
+        val fitHeight = fitWidth / aspectRatio
+
+        Surface(
+            modifier = modifier.size(width = fitWidth, height = fitHeight),
+            shape = RoundedCornerShape(4.dp),
+            color = bgColor,
+            shadowElevation = 6.dp
         ) {
-            val canvasWidth = maxWidth
-            val canvasHeight = maxHeight
-            // Scale PowerPoint point sizes proportionally to the actual rendered slide width.
-            val ptScale = canvasWidth.value / slideWidthPt.coerceAtLeast(320f)
+            BoxWithConstraints(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clipToBounds()
+            ) {
+                val canvasWidth = maxWidth
+                val canvasHeight = maxHeight
+                // Proportional point-to-dp scale, normalized against Android system fontScale.
+                val ptScale = canvasWidth.value / slideWidthPt.coerceAtLeast(320f)
 
-            if (!slide.backgroundImagePath.isNullOrBlank()) {
-                AsyncImage(
-                    model = ImageRequest.Builder(context)
-                        .data(File(slide.backgroundImagePath))
-                        .crossfade(false)
-                        .build(),
-                    contentDescription = null,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize()
-                )
-            }
+                if (!slide.backgroundImagePath.isNullOrBlank()) {
+                    AsyncImage(
+                        model = ImageRequest.Builder(context)
+                            .data(File(slide.backgroundImagePath))
+                            .crossfade(false)
+                            .build(),
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
 
-            slide.elements.forEach { element ->
-                val xDp = canvasWidth * element.xFraction
-                val yDp = canvasHeight * element.yFraction
-                val wDp = canvasWidth * element.widthFraction
-                val hDp = canvasHeight * element.heightFraction
+                slide.elements.forEach { element ->
+                    val xDp = canvasWidth * element.xFraction
+                    val yDp = canvasHeight * element.yFraction
+                    val wDp = canvasWidth * element.widthFraction
+                    val hDp = canvasHeight * element.heightFraction
 
-                when (element) {
-                    is SlideElement.ImageElement -> {
-                        AsyncImage(
-                            model = ImageRequest.Builder(context)
-                                .data(File(element.imagePath))
-                                .crossfade(false)
-                                .build(),
-                            contentDescription = "Slide image",
-                            contentScale = ContentScale.FillBounds,
-                            modifier = Modifier
-                                .offset(x = xDp, y = yDp)
-                                .size(width = wDp, height = hDp)
-                        )
-                    }
+                    when (element) {
+                        is SlideElement.ImageElement -> {
+                            AsyncImage(
+                                model = ImageRequest.Builder(context)
+                                    .data(File(element.imagePath))
+                                    .crossfade(false)
+                                    .build(),
+                                contentDescription = "Slide image",
+                                contentScale = ContentScale.FillBounds,
+                                modifier = Modifier
+                                    .offset(x = xDp, y = yDp)
+                                    .size(width = wDp, height = hDp)
+                            )
+                        }
 
-                    is SlideElement.ShapeTextElement -> {
-                        val fill = element.fillColorArgb?.let { Color(it) } ?: Color.Transparent
-                        val borderMod = element.borderColorArgb?.let { argb ->
-                            Modifier.border(0.75.dp, Color(argb))
-                        } ?: Modifier
+                        is SlideElement.ShapeTextElement -> {
+                            val fill = element.fillColorArgb?.let { Color(it) } ?: Color.Transparent
+                            val borderMod = element.borderColorArgb?.let { argb ->
+                                Modifier.border(0.75.dp, Color(argb))
+                            } ?: Modifier
 
-                        Box(
-                            modifier = Modifier
-                                .offset(x = xDp, y = yDp)
-                                .size(width = wDp, height = hDp)
-                                .background(fill)
-                                .then(borderMod)
-                                .padding(horizontal = 3.dp, vertical = 2.dp)
-                        ) {
-                            Column(
-                                modifier = Modifier.fillMaxSize(),
-                                verticalArrangement = Arrangement.spacedBy(2.dp)
+                            Box(
+                                modifier = Modifier
+                                    .offset(x = xDp, y = yDp)
+                                    .size(width = wDp, height = hDp)
+                                    .background(fill)
+                                    .then(borderMod)
+                                    .padding(horizontal = 2.dp, vertical = 1.dp)
                             ) {
-                                element.paragraphs.forEach { para ->
-                                    val scaledSp = (para.fontSizePt * ptScale * 1.05f)
-                                        .coerceIn(6.5f, 34f)
-                                    val defaultTextColor = if (isDarkColor(bgColor) && fill == Color.Transparent) {
-                                        Color.White
-                                    } else if (fill != Color.Transparent && isDarkColor(fill)) {
-                                        Color.White
-                                    } else {
-                                        Color(0xFF1A1D21)
-                                    }
-                                    val prefix = if (para.isBullet) "• " else ""
+                                Column(
+                                    modifier = Modifier.fillMaxSize(),
+                                    verticalArrangement = Arrangement.spacedBy(1.dp)
+                                ) {
+                                    element.paragraphs.forEach { para ->
+                                        val scaledSp = ((para.fontSizePt * ptScale * 0.88f) / fontScale)
+                                            .coerceIn(5.5f, 30f)
+                                        val defaultTextColor = if (isDarkColor(bgColor) && fill == Color.Transparent) {
+                                            Color.White
+                                        } else if (fill != Color.Transparent && isDarkColor(fill)) {
+                                            Color.White
+                                        } else {
+                                            Color(0xFF1A1D21)
+                                        }
+                                        val prefix = if (para.isBullet) "• " else ""
 
-                                    Text(
-                                        text = "$prefix${para.text}",
-                                        color = para.textColorArgb?.let { Color(it) } ?: defaultTextColor,
-                                        fontSize = scaledSp.sp,
-                                        lineHeight = (scaledSp * 1.2f).sp,
-                                        fontWeight = if (para.isBold) FontWeight.Bold else FontWeight.Normal,
-                                        fontStyle = if (para.isItalic) FontStyle.Italic else FontStyle.Normal,
-                                        textAlign = para.alignment.toSlideTextAlign(),
-                                        overflow = TextOverflow.Ellipsis,
-                                        modifier = Modifier.fillMaxWidth()
-                                    )
+                                        Text(
+                                            text = "$prefix${para.text}",
+                                            color = para.textColorArgb?.let { Color(it) } ?: defaultTextColor,
+                                            fontSize = scaledSp.sp,
+                                            lineHeight = (scaledSp * 1.12f).sp,
+                                            fontWeight = if (para.isBold) FontWeight.Bold else FontWeight.Normal,
+                                            fontStyle = if (para.isItalic) FontStyle.Italic else FontStyle.Normal,
+                                            textAlign = para.alignment.toSlideTextAlign(),
+                                            softWrap = true,
+                                            overflow = TextOverflow.Clip,
+                                            modifier = Modifier.fillMaxWidth()
+                                        )
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    is SlideElement.TableElement -> {
-                        val tableFontSp = (12f * ptScale).coerceIn(6.5f, 16f)
-                        Surface(
-                            color = Color.White.copy(alpha = 0.94f),
-                            border = BorderStroke(0.5.dp, Color(0xFFCBD5E1)),
-                            modifier = Modifier
-                                .offset(x = xDp, y = yDp)
-                                .size(width = wDp, height = hDp)
-                        ) {
-                            Column(modifier = Modifier.fillMaxSize()) {
-                                element.rows.forEachIndexed { rowIdx, row ->
-                                    Row(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .background(
-                                                if (rowIdx == 0) Color(0xFFEEF2F7) else Color.Transparent
-                                            )
-                                            .padding(horizontal = 3.dp, vertical = 2.dp),
-                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
-                                    ) {
-                                        row.forEach { cell ->
-                                            Text(
-                                                text = cell,
-                                                color = Color(0xFF1A1D21),
-                                                fontSize = tableFontSp.sp,
-                                                lineHeight = (tableFontSp * 1.15f).sp,
-                                                fontWeight = if (rowIdx == 0) FontWeight.Bold else FontWeight.Normal,
-                                                maxLines = 3,
-                                                overflow = TextOverflow.Ellipsis,
-                                                modifier = Modifier.weight(1f)
-                                            )
+                        is SlideElement.TableElement -> {
+                            val tableFontSp = ((11f * ptScale * 0.88f) / fontScale).coerceIn(5.5f, 15f)
+                            Surface(
+                                color = Color.White.copy(alpha = 0.94f),
+                                border = BorderStroke(0.5.dp, Color(0xFFCBD5E1)),
+                                modifier = Modifier
+                                    .offset(x = xDp, y = yDp)
+                                    .size(width = wDp, height = hDp)
+                            ) {
+                                Column(modifier = Modifier.fillMaxSize()) {
+                                    element.rows.forEachIndexed { rowIdx, row ->
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .background(
+                                                    if (rowIdx == 0) Color(0xFFEEF2F7) else Color.Transparent
+                                                )
+                                                .padding(horizontal = 2.dp, vertical = 1.dp),
+                                            horizontalArrangement = Arrangement.spacedBy(3.dp)
+                                        ) {
+                                            row.forEach { cell ->
+                                                Text(
+                                                    text = cell,
+                                                    color = Color(0xFF1A1D21),
+                                                    fontSize = tableFontSp.sp,
+                                                    lineHeight = (tableFontSp * 1.12f).sp,
+                                                    fontWeight = if (rowIdx == 0) FontWeight.Bold else FontWeight.Normal,
+                                                    maxLines = 3,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                    modifier = Modifier.weight(1f)
+                                                )
+                                            }
                                         }
+                                        HorizontalDivider(color = Color(0xFFE2E8F0), thickness = 0.5.dp)
                                     }
-                                    HorizontalDivider(color = Color(0xFFE2E8F0), thickness = 0.5.dp)
                                 }
                             }
                         }
