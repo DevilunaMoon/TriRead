@@ -17,6 +17,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -54,6 +56,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -69,6 +72,7 @@ import com.triread.app.data.parser.DocHeaderFooter
 import com.triread.app.data.parser.DocPageMetrics
 import com.triread.app.data.parser.DocRun
 import com.triread.app.data.parser.DocTextAlignment
+import com.triread.app.data.parser.HeaderFooterElement
 import com.triread.app.ui.viewer.ReaderTheme
 import com.triread.app.ui.viewer.ReaderTypographySettings
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -153,7 +157,7 @@ private fun DocReflowableContent(
             top = if (isImmersive) 20.dp else 96.dp,
             bottom = if (isImmersive) 28.dp else 88.dp
         ),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+        verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         if (!noticeMessage.isNullOrBlank()) {
             item(key = "doc_notice") {
@@ -309,6 +313,8 @@ private fun LiteralPrintPageSheet(
     ) {
         BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
             val ptScale = maxWidth.value / pageMetrics.widthPt.coerceAtLeast(300f)
+            val usableWidthDp = ((pageMetrics.widthPt - pageMetrics.marginLeftPt - pageMetrics.marginRightPt) * ptScale)
+                .coerceAtLeast(160f).dp
             val padLeft = (pageMetrics.marginLeftPt * ptScale).dp
             val padRight = (pageMetrics.marginRightPt * ptScale).dp
             val padTop = (pageMetrics.marginTopPt * ptScale).dp
@@ -320,52 +326,62 @@ private fun LiteralPrintPageSheet(
                     .padding(
                         start = padLeft,
                         end = padRight,
-                        top = (padTop * 0.35f).coerceAtLeast(8.dp),
-                        bottom = (padBottom * 0.35f).coerceAtLeast(8.dp)
+                        top = (padTop * 0.25f).coerceAtLeast(6.dp),
+                        bottom = (padBottom * 0.28f).coerceAtLeast(6.dp)
                     )
             ) {
-                // Header Section (logos + header lines, e.g. USTP letterhead)
+                // Header Section: stacked vertically in exact document order & real EMU extent sizes
                 if (header != null && header.isNotEmpty) {
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(bottom = (6f * ptScale).dp),
+                            .padding(bottom = (8f * ptScale).dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.spacedBy((2f * ptScale).dp)
                     ) {
-                        if (header.imagePaths.isNotEmpty()) {
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy((6f * ptScale).dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                header.imagePaths.forEach { imgPath ->
+                        header.elements.forEach { elem ->
+                            when (elem) {
+                                is HeaderFooterElement.Image -> {
+                                    val imgModifier = if (elem.widthPt != null && elem.heightPt != null) {
+                                        val wDp = (elem.widthPt * ptScale).dp.coerceAtMost(usableWidthDp)
+                                        val ratio = (elem.widthPt / elem.heightPt.coerceAtLeast(1f)).coerceIn(0.2f, 12f)
+                                        Modifier
+                                            .width(wDp)
+                                            .aspectRatio(ratio)
+                                    } else {
+                                        Modifier
+                                            .widthIn(max = usableWidthDp)
+                                            .height((44f * ptScale).dp.coerceIn(22.dp, 56.dp))
+                                    }
                                     AsyncImage(
                                         model = ImageRequest.Builder(context)
-                                            .data(File(imgPath))
+                                            .data(File(elem.imagePath))
                                             .crossfade(false)
                                             .build(),
                                         contentDescription = "Document header logo",
                                         contentScale = ContentScale.Fit,
-                                        modifier = Modifier.height((42f * ptScale).dp.coerceIn(22.dp, 52.dp))
+                                        modifier = imgModifier
+                                    )
+                                }
+
+                                is HeaderFooterElement.TextLine -> {
+                                    val hdrSp = ((7.5f * ptScale) / fontScale).coerceIn(4.8f, 11f)
+                                    Text(
+                                        text = elem.text,
+                                        color = Color(0xFF1F2937),
+                                        fontSize = hdrSp.sp,
+                                        lineHeight = (hdrSp * 1.15f).sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        fontFamily = resolveDocFontFamily(elem.fontFamilyName),
+                                        textAlign = TextAlign.Center,
+                                        modifier = Modifier.fillMaxWidth()
                                     )
                                 }
                             }
                         }
-                        val hdrSp = ((7.5f * ptScale) / fontScale).coerceIn(4.8f, 11f)
-                        header.lines.forEach { line ->
-                            Text(
-                                text = line,
-                                color = Color(0xFF1F2937),
-                                fontSize = hdrSp.sp,
-                                lineHeight = (hdrSp * 1.15f).sp,
-                                fontWeight = FontWeight.SemiBold,
-                                textAlign = TextAlign.Center,
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                        }
                     }
                 } else {
-                    Spacer(modifier = Modifier.height((padTop * 0.55f).coerceAtLeast(6.dp)))
+                    Spacer(modifier = Modifier.height((padTop * 0.6f).coerceAtLeast(6.dp)))
                 }
 
                 // Body Section
@@ -407,12 +423,10 @@ private fun LiteralPrintPageSheet(
                             is DocBlock.Paragraph -> {
                                 val defaultPt = 10.5f
                                 val fullPlain = block.plainText
-                                // Handle single-tab left/right alignment lines (e.g., Name <tab> Date)
                                 if (!block.isBullet && fullPlain.contains("\t")) {
-                                    val parts = fullPlain.split("\t").map { it.trim() }.filter { it.isNotEmpty() }
-                                    if (parts.size == 2) {
+                                    val (leftRuns, rightRuns) = splitRunsAtFirstTab(block.runs)
+                                    if (leftRuns.isNotEmpty() && rightRuns.isNotEmpty()) {
                                         val lineSp = ((defaultPt * 1.18f * ptScale) / fontScale).coerceIn(5.5f, 20f)
-                                        val txtSp = ((defaultPt * ptScale) / fontScale).coerceIn(5f, 18f)
                                         Row(
                                             modifier = Modifier
                                                 .fillMaxWidth()
@@ -423,15 +437,25 @@ private fun LiteralPrintPageSheet(
                                             horizontalArrangement = Arrangement.SpaceBetween
                                         ) {
                                             Text(
-                                                text = parts[0],
-                                                color = Color(0xFF111827),
-                                                fontSize = txtSp.sp,
+                                                text = buildRunsAnnotatedString(
+                                                    runs = leftRuns,
+                                                    defaultFontSizePt = defaultPt,
+                                                    forceBold = false,
+                                                    defaultColor = Color(0xFF111827),
+                                                    ptScale = ptScale,
+                                                    fontScale = fontScale
+                                                ),
                                                 lineHeight = lineSp.sp
                                             )
                                             Text(
-                                                text = parts[1],
-                                                color = Color(0xFF111827),
-                                                fontSize = txtSp.sp,
+                                                text = buildRunsAnnotatedString(
+                                                    runs = rightRuns,
+                                                    defaultFontSizePt = defaultPt,
+                                                    forceBold = false,
+                                                    defaultColor = Color(0xFF111827),
+                                                    ptScale = ptScale,
+                                                    fontScale = fontScale
+                                                ),
                                                 lineHeight = lineSp.sp
                                             )
                                         }
@@ -444,6 +468,17 @@ private fun LiteralPrintPageSheet(
                             }
 
                             is DocBlock.ImageBlock -> {
+                                val imgModifier = if (block.widthPt != null && block.heightPt != null) {
+                                    val wDp = (block.widthPt * ptScale).dp.coerceAtMost(usableWidthDp)
+                                    val ratio = (block.widthPt / block.heightPt.coerceAtLeast(1f)).coerceIn(0.2f, 8f)
+                                    Modifier
+                                        .width(wDp)
+                                        .aspectRatio(ratio)
+                                } else {
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(max = (150f * ptScale).dp.coerceAtLeast(56.dp))
+                                }
                                 AsyncImage(
                                     model = ImageRequest.Builder(context)
                                         .data(File(block.imagePath))
@@ -451,10 +486,7 @@ private fun LiteralPrintPageSheet(
                                         .build(),
                                     contentDescription = "Document image",
                                     contentScale = ContentScale.Fit,
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .heightIn(max = (150f * ptScale).dp.coerceAtLeast(56.dp))
-                                        .padding(vertical = (3f * ptScale).dp)
+                                    modifier = imgModifier.padding(vertical = (3f * ptScale).dp)
                                 )
                             }
 
@@ -480,14 +512,21 @@ private fun LiteralPrintPageSheet(
                                 HorizontalDivider(color = Color(0xFFCBD5E1), thickness = 0.5.dp)
                             }
 
+                            is DocBlock.Spacer -> {
+                                Spacer(modifier = Modifier.height((block.heightPt * ptScale).dp))
+                            }
+
                             DocBlock.PageBreak -> Unit
                         }
                     }
                 }
 
-                // Footer Section (footer address lines + right-aligned footer logo like SOCOTEC)
+                // Footer Section (text lines + right-aligned footer logo like SOCOTEC)
                 if (footer != null && footer.isNotEmpty) {
+                    val footerLines = footer.elements.filterIsInstance<HeaderFooterElement.TextLine>()
+                    val footerImages = footer.elements.filterIsInstance<HeaderFooterElement.Image>()
                     val ftrSp = ((7f * ptScale) / fontScale).coerceIn(4.5f, 10f)
+
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -496,28 +535,30 @@ private fun LiteralPrintPageSheet(
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            footer.lines.forEach { line ->
+                            footerLines.forEach { line ->
                                 Text(
-                                    text = line,
+                                    text = line.text,
                                     color = Color(0xFF475569),
                                     fontSize = ftrSp.sp,
                                     lineHeight = (ftrSp * 1.18f).sp,
+                                    fontFamily = resolveDocFontFamily(line.fontFamilyName),
                                     textAlign = TextAlign.Center,
                                     modifier = Modifier.fillMaxWidth()
                                 )
                             }
                         }
-                        if (footer.imagePaths.isNotEmpty()) {
+                        if (footerImages.isNotEmpty()) {
                             Row(horizontalArrangement = Arrangement.spacedBy((4f * ptScale).dp)) {
-                                footer.imagePaths.forEach { imgPath ->
+                                footerImages.forEach { img ->
+                                    val hDp = ((img.heightPt ?: 30f) * ptScale).dp.coerceIn(16.dp, 40.dp)
                                     AsyncImage(
                                         model = ImageRequest.Builder(context)
-                                            .data(File(imgPath))
+                                            .data(File(img.imagePath))
                                             .crossfade(false)
                                             .build(),
                                         contentDescription = "Document footer logo",
                                         contentScale = ContentScale.Fit,
-                                        modifier = Modifier.height((26f * ptScale).dp.coerceIn(14.dp, 36.dp))
+                                        modifier = Modifier.height(hDp)
                                     )
                                 }
                             }
@@ -545,32 +586,58 @@ private fun PrintParagraphText(
     ptScale: Float,
     fontScale: Float
 ) {
-    val prefix = if (block.isBullet) "•  " else ""
+    val maxRunPt = block.runs.maxOfOrNull { it.fontSizePt ?: defaultPt } ?: defaultPt
+    val lineSp = ((maxRunPt * 1.18f * ptScale) / fontScale).coerceIn(5.5f, 22f)
     val annotated = buildRunsAnnotatedString(
         runs = block.runs,
-        prefix = prefix,
         defaultFontSizePt = defaultPt,
         forceBold = false,
         defaultColor = Color(0xFF111827),
         ptScale = ptScale,
         fontScale = fontScale
     )
-    val maxRunPt = block.runs.maxOfOrNull { it.fontSizePt ?: defaultPt } ?: defaultPt
-    val lineSp = ((maxRunPt * 1.18f * ptScale) / fontScale).coerceIn(5.5f, 22f)
-    val indentDp = ((block.indentLeftPt + if (block.isBullet) 12f else 0f) * ptScale).dp
 
-    Text(
-        text = annotated,
-        lineHeight = lineSp.sp,
-        textAlign = block.alignment.toComposeTextAlign(),
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(
-                start = indentDp,
-                top = (block.spaceBeforePt * ptScale).dp,
-                bottom = (block.spaceAfterPt * ptScale).dp
+    if (block.isBullet) {
+        val bulletSp = ((defaultPt * ptScale) / fontScale).coerceIn(5f, 18f)
+        val baseIndent = (block.indentLeftPt.coerceAtLeast(14f) * ptScale).dp
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(
+                    start = baseIndent,
+                    top = (block.spaceBeforePt * ptScale).dp,
+                    bottom = (block.spaceAfterPt * ptScale).dp
+                ),
+            verticalAlignment = Alignment.Top
+        ) {
+            Text(
+                text = "•",
+                color = Color(0xFF111827),
+                fontSize = bulletSp.sp,
+                lineHeight = lineSp.sp,
+                modifier = Modifier.width((12f * ptScale).dp.coerceAtLeast(8.dp))
             )
-    )
+            Text(
+                text = annotated,
+                lineHeight = lineSp.sp,
+                textAlign = block.alignment.toComposeTextAlign(),
+                modifier = Modifier.weight(1f)
+            )
+        }
+    } else {
+        Text(
+            text = annotated,
+            lineHeight = lineSp.sp,
+            textAlign = block.alignment.toComposeTextAlign(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(
+                    start = (block.indentLeftPt * ptScale).dp,
+                    top = (block.spaceBeforePt * ptScale).dp,
+                    bottom = (block.spaceAfterPt * ptScale).dp
+                )
+        )
+    }
 }
 
 @Composable
@@ -609,22 +676,42 @@ private fun ReflowableDocBlock(
         }
 
         is DocBlock.Paragraph -> {
-            val prefix = if (block.isBullet) "•  " else ""
             val annotated = buildReflowableAnnotatedString(
                 runs = block.runs,
-                prefix = prefix,
                 defaultColor = textColor,
                 forceBold = false
             )
-            Text(
-                text = annotated,
-                fontSize = fontSizeSp.sp,
-                lineHeight = (fontSizeSp * lineHeightMultiplier).sp,
-                textAlign = block.alignment.toComposeTextAlign(),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(start = if (block.isBullet) 10.dp else 0.dp)
-            )
+            if (block.isBullet) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 10.dp),
+                    verticalAlignment = Alignment.Top
+                ) {
+                    Text(
+                        text = "•",
+                        color = textColor,
+                        fontSize = fontSizeSp.sp,
+                        lineHeight = (fontSizeSp * lineHeightMultiplier).sp,
+                        modifier = Modifier.width(16.dp)
+                    )
+                    Text(
+                        text = annotated,
+                        fontSize = fontSizeSp.sp,
+                        lineHeight = (fontSizeSp * lineHeightMultiplier).sp,
+                        textAlign = block.alignment.toComposeTextAlign(),
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            } else {
+                Text(
+                    text = annotated,
+                    fontSize = fontSizeSp.sp,
+                    lineHeight = (fontSizeSp * lineHeightMultiplier).sp,
+                    textAlign = block.alignment.toComposeTextAlign(),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
         }
 
         is DocBlock.ImageBlock -> {
@@ -668,6 +755,10 @@ private fun ReflowableDocBlock(
             }
         }
 
+        is DocBlock.Spacer -> {
+            Spacer(modifier = Modifier.height(6.dp))
+        }
+
         DocBlock.PageBreak -> {
             HorizontalDivider(
                 color = mutedColor.copy(alpha = 0.25f),
@@ -677,21 +768,38 @@ private fun ReflowableDocBlock(
     }
 }
 
+private fun splitRunsAtFirstTab(runs: List<DocRun>): Pair<List<DocRun>, List<DocRun>> {
+    val left = mutableListOf<DocRun>()
+    val right = mutableListOf<DocRun>()
+    var foundTab = false
+
+    for (run in runs) {
+        if (foundTab) {
+            right.add(run.copy(text = run.text.replace("\t", " ")))
+        } else {
+            val idx = run.text.indexOf('\t')
+            if (idx >= 0) {
+                foundTab = true
+                val before = run.text.substring(0, idx).trimEnd()
+                val after = run.text.substring(idx + 1).replace("\t", " ").trimStart()
+                if (before.isNotEmpty()) left.add(run.copy(text = before))
+                if (after.isNotEmpty()) right.add(run.copy(text = after))
+            } else {
+                left.add(run)
+            }
+        }
+    }
+    return left to right
+}
+
 private fun buildRunsAnnotatedString(
     runs: List<DocRun>,
-    prefix: String = "",
     defaultFontSizePt: Float,
     forceBold: Boolean,
     defaultColor: Color,
     ptScale: Float,
     fontScale: Float
 ): AnnotatedString = buildAnnotatedString {
-    if (prefix.isNotEmpty()) {
-        val sp = ((defaultFontSizePt * ptScale) / fontScale).coerceIn(5f, 26f)
-        withStyle(SpanStyle(color = defaultColor, fontSize = sp.sp)) {
-            append(prefix)
-        }
-    }
     runs.forEach { run ->
         val pt = run.fontSizePt ?: defaultFontSizePt
         val sp = ((pt * ptScale) / fontScale).coerceIn(5f, 26f)
@@ -699,6 +807,7 @@ private fun buildRunsAnnotatedString(
             SpanStyle(
                 color = run.colorArgb?.let { Color(it) } ?: defaultColor,
                 fontSize = sp.sp,
+                fontFamily = resolveDocFontFamily(run.fontFamilyName),
                 fontWeight = if (forceBold || run.isBold) FontWeight.Bold else FontWeight.Normal,
                 fontStyle = if (run.isItalic) FontStyle.Italic else FontStyle.Normal,
                 textDecoration = if (run.isUnderline) TextDecoration.Underline else TextDecoration.None
@@ -711,19 +820,14 @@ private fun buildRunsAnnotatedString(
 
 private fun buildReflowableAnnotatedString(
     runs: List<DocRun>,
-    prefix: String = "",
     defaultColor: Color,
     forceBold: Boolean
 ): AnnotatedString = buildAnnotatedString {
-    if (prefix.isNotEmpty()) {
-        withStyle(SpanStyle(color = defaultColor)) {
-            append(prefix)
-        }
-    }
     runs.forEach { run ->
         withStyle(
             SpanStyle(
                 color = defaultColor,
+                fontFamily = resolveDocFontFamily(run.fontFamilyName),
                 fontWeight = if (forceBold || run.isBold) FontWeight.Bold else FontWeight.Normal,
                 fontStyle = if (run.isItalic) FontStyle.Italic else FontStyle.Normal,
                 textDecoration = if (run.isUnderline) TextDecoration.Underline else TextDecoration.None
@@ -731,6 +835,38 @@ private fun buildReflowableAnnotatedString(
         ) {
             append(run.text.replace("\t", "    "))
         }
+    }
+}
+
+private fun resolveDocFontFamily(fontName: String?): FontFamily {
+    if (fontName.isNullOrBlank()) return FontFamily.SansSerif
+    val lower = fontName.lowercase(Locale.ROOT)
+    return when {
+        lower.contains("courier") ||
+            lower.contains("consolas") ||
+            lower.contains("mono") ||
+            lower.contains("menlo") ||
+            lower.contains("monaco") ||
+            lower.contains("fira code") ||
+            lower.contains("jetbrains") -> FontFamily.Monospace
+
+        lower.contains("times") ||
+            lower.contains("georgia") ||
+            lower.contains("cambria") ||
+            lower.contains("garamond") ||
+            lower.contains("palatino") ||
+            lower.contains("book antiqua") ||
+            lower.contains("century") ||
+            lower.contains("baskerville") ||
+            (lower.contains("serif") && !lower.contains("sans")) -> FontFamily.Serif
+
+        lower.contains("brush") ||
+            lower.contains("comic") ||
+            lower.contains("pacifico") ||
+            lower.contains("script") ||
+            lower.contains("cursive") -> FontFamily.Cursive
+
+        else -> FontFamily.SansSerif
     }
 }
 
@@ -763,8 +899,8 @@ private fun paginateBlocksForLiteralPrint(
     footer: DocHeaderFooter?
 ): List<List<DocBlock>> {
     if (blocks.isEmpty()) return listOf(emptyList())
-    val headerReservePt = if (header != null && header.isNotEmpty) 58f else metrics.marginTopPt * 0.6f
-    val footerReservePt = if (footer != null && footer.isNotEmpty) 42f else metrics.marginBottomPt * 0.6f
+    val headerReservePt = if (header != null && header.isNotEmpty) 82f else metrics.marginTopPt * 0.6f
+    val footerReservePt = if (footer != null && footer.isNotEmpty) 46f else metrics.marginBottomPt * 0.6f
     val usableHeightPt = (metrics.heightPt - headerReservePt - footerReservePt).coerceAtLeast(420f)
     val usableWidthPt = (metrics.widthPt - metrics.marginLeftPt - metrics.marginRightPt).coerceAtLeast(260f)
     val charsPerLine = (usableWidthPt / 4.7f).coerceAtLeast(52f)
@@ -785,15 +921,16 @@ private fun paginateBlocksForLiteralPrint(
         val estimatedPt = when (block) {
             is DocBlock.Heading -> {
                 val lines = ((block.plainText.length / (charsPerLine * 0.8f)).toInt() + 1).coerceAtLeast(1)
-                block.spaceBeforePt + block.spaceAfterPt + lines * 16f
+                block.spaceBeforePt + block.spaceAfterPt + lines * 15.5f
             }
             is DocBlock.Paragraph -> {
                 val effectiveChars = (charsPerLine - if (block.isBullet) 5f else 0f).coerceAtLeast(40f)
                 val lines = ((block.plainText.length / effectiveChars).toInt() + 1).coerceAtLeast(1)
-                block.spaceBeforePt + block.spaceAfterPt + lines * 12.2f
+                block.spaceBeforePt + block.spaceAfterPt + lines * 12f
             }
-            is DocBlock.ImageBlock -> 156f
+            is DocBlock.ImageBlock -> (block.heightPt ?: 140f).coerceAtMost(220f)
             is DocBlock.TableRow -> 22f
+            is DocBlock.Spacer -> block.heightPt
             DocBlock.PageBreak -> 0f
         }
         if (current.isNotEmpty() && usedPt + estimatedPt > usableHeightPt) {

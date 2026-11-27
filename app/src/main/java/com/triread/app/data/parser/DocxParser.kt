@@ -28,15 +28,31 @@ data class DocRun(
     val isItalic: Boolean = false,
     val isUnderline: Boolean = false,
     val fontSizePt: Float? = null,
-    val colorArgb: Long? = null
+    val colorArgb: Long? = null,
+    val fontFamilyName: String? = null
 )
 
+sealed interface HeaderFooterElement {
+    data class Image(
+        val imagePath: String,
+        val widthPt: Float? = null,
+        val heightPt: Float? = null
+    ) : HeaderFooterElement
+
+    data class TextLine(
+        val text: String,
+        val fontFamilyName: String? = null
+    ) : HeaderFooterElement
+}
+
 data class DocHeaderFooter(
-    val lines: List<String> = emptyList(),
-    val imagePaths: List<String> = emptyList()
+    val elements: List<HeaderFooterElement> = emptyList()
 ) {
     val isNotEmpty: Boolean
-        get() = lines.isNotEmpty() || imagePaths.isNotEmpty()
+        get() = elements.isNotEmpty()
+
+    val hasImages: Boolean
+        get() = elements.any { it is HeaderFooterElement.Image }
 }
 
 data class DocPageMetrics(
@@ -75,10 +91,14 @@ sealed interface DocBlock {
     }
 
     data class ImageBlock(
-        val imagePath: String
+        val imagePath: String,
+        val widthPt: Float? = null,
+        val heightPt: Float? = null
     ) : DocBlock
 
     data class TableRow(val cells: List<String>) : DocBlock
+
+    data class Spacer(val heightPt: Float = 9f) : DocBlock
 
     data object PageBreak : DocBlock
 }
@@ -110,6 +130,7 @@ class DocxParser(
 
                 var documentXml: ByteArray? = null
                 var documentRelsXml: ByteArray? = null
+                var stylesXml: ByteArray? = null
                 val headerXmls = mutableMapOf<String, ByteArray>()
                 val headerRels = mutableMapOf<String, ByteArray>()
                 val footerXmls = mutableMapOf<String, ByteArray>()
@@ -133,6 +154,9 @@ class DocxParser(
                                     }
                                     lower == "word/_rels/document.xml.rels" -> {
                                         documentRelsXml = readBounded(zip, MAX_RELS_BYTES)
+                                    }
+                                    lower == "word/styles.xml" -> {
+                                        stylesXml = readBounded(zip, MAX_RELS_BYTES)
                                     }
                                     lower.startsWith("word/header") && lower.endsWith(".xml") -> {
                                         headerXmls[lower] = readBounded(zip, MAX_RELS_BYTES)
@@ -163,11 +187,17 @@ class DocxParser(
 
                 val xmlBytes = documentXml
                 if (xmlBytes != null) {
+                    val defaultFontFamily = stylesXml?.let { parseDefaultFontFromStyles(it) }
                     val docRels = documentRelsXml?.let { parseRels(it) }.orEmpty()
-                    val (blocks, metrics) = parseWordDocumentXml(xmlBytes, docRels, cachedMedia)
+                    val (blocks, metrics) = parseWordDocumentXml(
+                        xmlBytes = xmlBytes,
+                        rels = docRels,
+                        cachedMedia = cachedMedia,
+                        defaultFontFamily = defaultFontFamily
+                    )
 
-                    val header = resolveHeaderFooter(headerXmls, headerRels, cachedMedia)
-                    val footer = resolveHeaderFooter(footerXmls, footerRels, cachedMedia)
+                    val header = resolveHeaderFooter(headerXmls, headerRels, cachedMedia, defaultFontFamily)
+                    val footer = resolveHeaderFooter(footerXmls, footerRels, cachedMedia, defaultFontFamily)
 
                     if (blocks.isEmpty()) {
                         ParsedDocumentContent(
@@ -193,29 +223,61 @@ class DocxParser(
             }
         }
 
+    private fun parseDefaultFontFromStyles(stylesXml: ByteArray): String? {
+        val parser = Xml.newPullParser()
+        parser.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, true)
+        ByteArrayInputStream(stylesXml).use { input ->
+            parser.setInput(input, "UTF-8")
+            var eventType = parser.eventType
+            var inDocDefaults = false
+            while (eventType != XmlPullParser.END_DOCUMENT) {
+                val localName = parser.name.orEmpty()
+                when (eventType) {
+                    XmlPullParser.START_TAG -> when (localName) {
+                        "docDefaults" -> inDocDefaults = true
+                        "rFonts" -> if (inDocDefaults) {
+                            val font = findAttributeByLocalName(parser, "ascii")
+                                ?: findAttributeByLocalName(parser, "hAnsi")
+                                ?: findAttributeByLocalName(parser, "cs")
+                            if (!font.isNullOrBlank()) return font
+                        }
+                    }
+                    XmlPullParser.END_TAG -> if (localName == "docDefaults") {
+                        inDocDefaults = false
+                    }
+                }
+                eventType = parser.next()
+            }
+        }
+        return null
+    }
+
     private fun resolveHeaderFooter(
         xmlMap: Map<String, ByteArray>,
         relsMap: Map<String, ByteArray>,
-        cachedMedia: Map<String, String>
+        cachedMedia: Map<String, String>,
+        defaultFontFamily: String?
     ): DocHeaderFooter? {
         if (xmlMap.isEmpty()) return null
-        // Prefer header1/footer1 or the first entry that has images/text
         val sortedKeys = xmlMap.keys.sorted()
         val parsedList = sortedKeys.map { key ->
             val rels = relsMap[key]?.let { parseRels(it) }.orEmpty()
-            parseHeaderFooterXml(xmlMap.getValue(key), rels, cachedMedia)
+            parseHeaderFooterXml(xmlMap.getValue(key), rels, cachedMedia, defaultFontFamily)
         }
-        return parsedList.firstOrNull { it.imagePaths.isNotEmpty() }
+        return parsedList.firstOrNull { it.hasImages }
             ?: parsedList.firstOrNull { it.isNotEmpty }
     }
 
     private fun parseHeaderFooterXml(
         xmlBytes: ByteArray,
         rels: Map<String, String>,
-        cachedMedia: Map<String, String>
+        cachedMedia: Map<String, String>,
+        defaultFontFamily: String?
     ): DocHeaderFooter {
-        val lines = mutableListOf<String>()
-        val imagePaths = mutableListOf<String>()
+        val elements = mutableListOf<HeaderFooterElement>()
+        val seenTextLines = HashSet<String>()
+        val seenImages = HashSet<String>()
+
         val parser = Xml.newPullParser()
         parser.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, true)
 
@@ -225,6 +287,9 @@ class DocxParser(
             var fallbackDepth = 0
             var inParagraph = false
             val currentLine = StringBuilder()
+            var currentFont: String? = null
+            var pendingExtentWidthPt: Float? = null
+            var pendingExtentHeightPt: Float? = null
 
             while (eventType != XmlPullParser.END_DOCUMENT) {
                 val localName = parser.name.orEmpty()
@@ -238,6 +303,20 @@ class DocxParser(
                                 "p" -> {
                                     inParagraph = true
                                     currentLine.clear()
+                                    currentFont = defaultFontFamily
+                                }
+                                "rFonts" -> if (inParagraph) {
+                                    val font = findAttributeByLocalName(parser, "ascii")
+                                        ?: findAttributeByLocalName(parser, "hAnsi")
+                                    if (!font.isNullOrBlank()) currentFont = font
+                                }
+                                "extent" -> {
+                                    val cx = findAttributeByLocalName(parser, "cx")?.toFloatOrNull()
+                                    val cy = findAttributeByLocalName(parser, "cy")?.toFloatOrNull()
+                                    if (cx != null && cy != null && cx > 0f && cy > 0f) {
+                                        pendingExtentWidthPt = cx / EMU_PER_PT
+                                        pendingExtentHeightPt = cy / EMU_PER_PT
+                                    }
                                 }
                                 "t" -> if (inParagraph) {
                                     currentLine.append(parser.nextText())
@@ -248,15 +327,31 @@ class DocxParser(
                                 "blip" -> {
                                     val rId = findAttributeByLocalName(parser, "embed")
                                     val path = rId?.let { rels[it] }?.let { cachedMedia[it] }
-                                    if (!path.isNullOrBlank() && path !in imagePaths) {
-                                        imagePaths.add(path)
+                                    if (!path.isNullOrBlank() && seenImages.add(path)) {
+                                        elements.add(
+                                            HeaderFooterElement.Image(
+                                                imagePath = path,
+                                                widthPt = pendingExtentWidthPt,
+                                                heightPt = pendingExtentHeightPt
+                                            )
+                                        )
+                                        pendingExtentWidthPt = null
+                                        pendingExtentHeightPt = null
                                     }
                                 }
                                 "imagedata" -> {
                                     val rId = findAttributeByLocalName(parser, "id")
                                     val path = rId?.let { rels[it] }?.let { cachedMedia[it] }
-                                    if (!path.isNullOrBlank() && path !in imagePaths) {
-                                        imagePaths.add(path)
+                                    if (!path.isNullOrBlank() && seenImages.add(path)) {
+                                        elements.add(
+                                            HeaderFooterElement.Image(
+                                                imagePath = path,
+                                                widthPt = pendingExtentWidthPt,
+                                                heightPt = pendingExtentHeightPt
+                                            )
+                                        )
+                                        pendingExtentWidthPt = null
+                                        pendingExtentHeightPt = null
                                     }
                                 }
                             }
@@ -268,8 +363,13 @@ class DocxParser(
                             fallbackDepth--
                         } else if (fallbackDepth == 0 && localName == "p" && inParagraph) {
                             val trimmed = currentLine.toString().trim()
-                            if (trimmed.isNotEmpty() && trimmed !in lines) {
-                                lines.add(trimmed)
+                            if (trimmed.isNotEmpty() && seenTextLines.add(trimmed)) {
+                                elements.add(
+                                    HeaderFooterElement.TextLine(
+                                        text = trimmed,
+                                        fontFamilyName = currentFont
+                                    )
+                                )
                             }
                             inParagraph = false
                         }
@@ -278,7 +378,7 @@ class DocxParser(
                 eventType = parser.next()
             }
         }
-        return DocHeaderFooter(lines = lines, imagePaths = imagePaths)
+        return DocHeaderFooter(elements = elements)
     }
 
     private fun parseRels(relsBytes: ByteArray): Map<String, String> {
@@ -310,7 +410,8 @@ class DocxParser(
     private suspend fun parseWordDocumentXml(
         xmlBytes: ByteArray,
         rels: Map<String, String>,
-        cachedMedia: Map<String, String>
+        cachedMedia: Map<String, String>,
+        defaultFontFamily: String?
     ): Pair<List<DocBlock>, DocPageMetrics> {
         val blocks = mutableListOf<DocBlock>()
         var pageMetrics = DocPageMetrics()
@@ -337,8 +438,11 @@ class DocxParser(
             var firstLineIndentPt = 0f
             var spaceBeforePt = 0f
             var spaceAfterPt = 4f
-            val paragraphImagePaths = mutableListOf<String>()
+            val paragraphImages = mutableListOf<DocBlock.ImageBlock>()
+            var pendingExtentW: Float? = null
+            var pendingExtentH: Float? = null
             var hasPageBreak = false
+            var consecutiveSpacers = 0
 
             val runText = StringBuilder()
             var runBold = false
@@ -346,6 +450,7 @@ class DocxParser(
             var runUnderline = false
             var runFontSizePt: Float? = null
             var runColorArgb: Long? = null
+            var runFontFamily: String? = defaultFontFamily
 
             var currentCellText = StringBuilder()
             val currentRowCells = mutableListOf<String>()
@@ -401,7 +506,9 @@ class DocxParser(
                                     firstLineIndentPt = 0f
                                     spaceBeforePt = 0f
                                     spaceAfterPt = 4f
-                                    paragraphImagePaths.clear()
+                                    paragraphImages.clear()
+                                    pendingExtentW = null
+                                    pendingExtentH = null
                                     hasPageBreak = false
                                 }
                                 "pStyle" -> if (inParagraph) {
@@ -427,9 +534,7 @@ class DocxParser(
                                         spaceAfterPt = (it / TWIPS_PER_PT).coerceIn(0f, 36f)
                                     }
                                 }
-                                "numPr" -> if (inParagraph) {
-                                    isBullet = true
-                                }
+                                "numPr" -> if (inParagraph) isBullet = true
                                 "r" -> if (inParagraph) {
                                     inRun = true
                                     runText.clear()
@@ -438,8 +543,15 @@ class DocxParser(
                                     runUnderline = false
                                     runFontSizePt = null
                                     runColorArgb = null
+                                    runFontFamily = defaultFontFamily
                                 }
                                 "rPr" -> if (inRun) inRunProps = true
+                                "rFonts" -> if (inRunProps) {
+                                    val font = findAttributeByLocalName(parser, "ascii")
+                                        ?: findAttributeByLocalName(parser, "hAnsi")
+                                        ?: findAttributeByLocalName(parser, "cs")
+                                    if (!font.isNullOrBlank()) runFontFamily = font
+                                }
                                 "b" -> if (inRunProps) {
                                     val boldVal = findAttributeByLocalName(parser, "val")
                                     if (boldVal != "0" && boldVal != "false") runBold = true
@@ -463,9 +575,15 @@ class DocxParser(
                                         hex.toLongOrNull(16)?.let { rgb -> runColorArgb = 0xFF000000L or rgb }
                                     }
                                 }
-                                "tab" -> if (inRun) {
-                                    runText.append("\t")
+                                "extent" -> if (inParagraph) {
+                                    val cx = findAttributeByLocalName(parser, "cx")?.toFloatOrNull()
+                                    val cy = findAttributeByLocalName(parser, "cy")?.toFloatOrNull()
+                                    if (cx != null && cy != null && cx > 0f && cy > 0f) {
+                                        pendingExtentW = cx / EMU_PER_PT
+                                        pendingExtentH = cy / EMU_PER_PT
+                                    }
                                 }
+                                "tab" -> if (inRun) runText.append("\t")
                                 "br" -> if (inParagraph) {
                                     val brType = findAttributeByLocalName(parser, "type")
                                     if (brType.equals("page", ignoreCase = true)) {
@@ -477,7 +595,17 @@ class DocxParser(
                                 "blip" -> if (inParagraph) {
                                     val rId = findAttributeByLocalName(parser, "embed")
                                     val path = rId?.let { rels[it] }?.let { cachedMedia[it] }
-                                    if (!path.isNullOrBlank()) paragraphImagePaths.add(path)
+                                    if (!path.isNullOrBlank()) {
+                                        paragraphImages.add(
+                                            DocBlock.ImageBlock(
+                                                imagePath = path,
+                                                widthPt = pendingExtentW,
+                                                heightPt = pendingExtentH
+                                            )
+                                        )
+                                        pendingExtentW = null
+                                        pendingExtentH = null
+                                    }
                                 }
                                 "t" -> if (inRun) {
                                     val text = parser.nextText()
@@ -504,7 +632,8 @@ class DocxParser(
                                                 isItalic = runItalic,
                                                 isUnderline = runUnderline,
                                                 fontSizePt = runFontSizePt,
-                                                colorArgb = runColorArgb
+                                                colorArgb = runColorArgb,
+                                                fontFamilyName = runFontFamily
                                             )
                                         )
                                     }
@@ -513,6 +642,7 @@ class DocxParser(
                                 "p" -> if (inParagraph) {
                                     val combined = paragraphRuns.joinToString("") { it.text }.trim()
                                     if (combined.isNotEmpty()) {
+                                        consecutiveSpacers = 0
                                         if (inTableCell) {
                                             if (currentCellText.isNotEmpty()) currentCellText.append("\n")
                                             currentCellText.append(combined)
@@ -539,12 +669,22 @@ class DocxParser(
                                                 )
                                             )
                                         }
+                                    } else if (!inTableCell && paragraphImages.isEmpty() && !hasPageBreak) {
+                                        // Preserve empty <w:p/> spacer lines between sections (cap at 2 in a row)
+                                        if (blocks.isNotEmpty() && consecutiveSpacers < 2) {
+                                            blocks.add(DocBlock.Spacer(heightPt = 9f))
+                                            consecutiveSpacers++
+                                        }
                                     }
                                     if (!inTableCell) {
-                                        paragraphImagePaths.forEach { imgPath ->
-                                            blocks.add(DocBlock.ImageBlock(imgPath))
+                                        if (paragraphImages.isNotEmpty()) {
+                                            consecutiveSpacers = 0
+                                            blocks.addAll(paragraphImages)
                                         }
-                                        if (hasPageBreak) blocks.add(DocBlock.PageBreak)
+                                        if (hasPageBreak) {
+                                            consecutiveSpacers = 0
+                                            blocks.add(DocBlock.PageBreak)
+                                        }
                                     }
                                     inParagraph = false
                                 }
@@ -554,6 +694,7 @@ class DocxParser(
                                 }
                                 "tr" -> if (inTableRow) {
                                     if (currentRowCells.any { it.isNotEmpty() }) {
+                                        consecutiveSpacers = 0
                                         blocks.add(DocBlock.TableRow(currentRowCells.toList()))
                                     }
                                     inTableRow = false
@@ -706,6 +847,7 @@ class DocxParser(
     companion object {
         private const val DOC_MEDIA_DIR = "doc_media"
         private const val TWIPS_PER_PT = 20f
+        private const val EMU_PER_PT = 12700f
         private const val MAX_XML_BYTES = 16 * 1024 * 1024
         private const val MAX_RELS_BYTES = 2 * 1024 * 1024
         private const val MAX_MEDIA_ENTRY_BYTES = 8 * 1024 * 1024
