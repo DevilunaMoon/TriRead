@@ -1,5 +1,6 @@
 package org.libreoffice.androidlib;
 
+import android.util.Log;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebView;
@@ -9,7 +10,19 @@ import androidx.annotation.Nullable;
 
 import org.libreoffice.kit.COKit;
 
+import java.io.ByteArrayInputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Intercepts Collabora's `cool:/cool/mobilesocket...` XHR endpoints used by `ProxySocket`
+ * (`global.js`) on Android so `cool.html` completes its session handshake (`/open/`) and
+ * streams binary/text frames from `LOActivity` (`/write/`) without Base64 JS overhead.
+ */
 public class COWebViewClient extends WebViewClient {
+
+    private static final String LOGTAG = "CollaboraBridge";
 
     static {
         COKit.ensureLibrariesLoaded();
@@ -20,7 +33,59 @@ public class COWebViewClient extends WebViewClient {
     @Nullable
     @Override
     public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+        if (request == null || request.getUrl() == null) {
+            return super.shouldInterceptRequest(view, request);
+        }
+
+        String url = request.getUrl().toString();
+        if (url.startsWith("cool:/cool/mobilesocket")) {
+            Map<String, String> headers = new HashMap<>();
+            headers.put("Access-Control-Allow-Origin", "*");
+            headers.put("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            headers.put("Access-Control-Allow-Headers", "*");
+            headers.put("Cache-Control", "no-store");
+
+            if (url.contains("/open/")) {
+                Log.i(LOGTAG, "MobileSocket /open/ handshake intercepted: " + url);
+                byte[] sessionId = "mobile".getBytes(StandardCharsets.UTF_8);
+                // Flush any early native messages shortly after JS marks readyState = 1
+                LOActivity.scheduleSocketFlush(80L);
+                return new WebResourceResponse(
+                        "text/plain",
+                        "UTF-8",
+                        200,
+                        "OK",
+                        headers,
+                        new ByteArrayInputStream(sessionId)
+                );
+            }
+
+            if (url.contains("/write/")) {
+                byte[] payload = LOActivity.drainPendingMessages();
+                Log.d(LOGTAG, "MobileSocket /write/ returning " + payload.length + " bytes");
+                return new WebResourceResponse(
+                        "application/octet-stream",
+                        null,
+                        200,
+                        "OK",
+                        headers,
+                        new ByteArrayInputStream(payload)
+                );
+            }
+
+            if (url.contains("/close/")) {
+                Log.i(LOGTAG, "MobileSocket /close/ intercepted");
+                return new WebResourceResponse(
+                        "text/plain",
+                        "UTF-8",
+                        200,
+                        "OK",
+                        headers,
+                        new ByteArrayInputStream(new byte[0])
+                );
+            }
+        }
+
         return super.shouldInterceptRequest(view, request);
     }
 }
-

@@ -10,10 +10,13 @@ import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
 import android.text.TextUtils
+import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.ConsoleMessage
+import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.widget.FrameLayout
@@ -175,6 +178,9 @@ class CollaboraViewerActivity : ComponentActivity() {
 
         val wv = WebView(this).apply {
             setBackgroundColor(bgColor)
+            // Software layer avoids Mali GPU EGL texture allocation failures (`BAD ALLOC`)
+            // that otherwise leave the WebView canvas blank.
+            setLayerType(View.LAYER_TYPE_SOFTWARE, null)
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
@@ -194,9 +200,23 @@ class CollaboraViewerActivity : ComponentActivity() {
                 mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             }
             addJavascriptInterface(loBridge.COOLMessageHandler(), "COOLMessageHandler")
+            webChromeClient = object : WebChromeClient() {
+                override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
+                    if (consoleMessage != null) {
+                        val msg = "${consoleMessage.message()} (${consoleMessage.sourceId()}:${consoleMessage.lineNumber()})"
+                        when (consoleMessage.messageLevel()) {
+                            ConsoleMessage.MessageLevel.ERROR -> Log.e(TAG_JS, msg)
+                            ConsoleMessage.MessageLevel.WARNING -> Log.w(TAG_JS, msg)
+                            else -> Log.d(TAG_JS, msg)
+                        }
+                    }
+                    return true
+                }
+            }
             webViewClient = object : COWebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     super.onPageFinished(view, url)
+                    Log.i(TAG_BRIDGE, "WebView onPageFinished: $url")
                     val hideReadOnlyChromeJs = """
                         (function() {
                             var style = document.createElement('style');
@@ -206,6 +226,8 @@ class CollaboraViewerActivity : ComponentActivity() {
                     """.trimIndent()
                     view?.evaluateJavascript(hideReadOnlyChromeJs, null)
                     loadingOverlay?.visibility = View.GONE
+                    // Ensure any queued messages from native COOLWSD are drained once page is ready
+                    LOActivity.scheduleSocketFlush(150L)
                 }
             }
         }
@@ -255,7 +277,9 @@ class CollaboraViewerActivity : ComponentActivity() {
                             "?file_path=${Uri.encode(fileUri)}" +
                             "&permission=readonly" +
                             "&closebutton=false" +
+                            "&userinterfacemode=classic" +
                             "&lang=en"
+                        Log.i(TAG_BRIDGE, "Loading cool.html: $coolUrl")
                         wv.loadUrl(coolUrl)
                     }
                 }
@@ -331,6 +355,8 @@ class CollaboraViewerActivity : ComponentActivity() {
         ).toInt()
 
     companion object {
+        private const val TAG_JS = "CollaboraJS"
+        private const val TAG_BRIDGE = "CollaboraBridge"
         const val EXTRA_FILE_PATH = "extra_file_path"
         const val EXTRA_TITLE = "extra_title"
         const val EXTRA_IS_PRESENTATION = "extra_is_presentation"

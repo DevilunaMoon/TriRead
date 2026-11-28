@@ -4,26 +4,34 @@ import android.app.Activity;
 import android.content.res.AssetManager;
 import android.os.Handler;
 import android.os.Looper;
-import android.util.Base64;
 import android.util.Log;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebView;
 
-import org.libreoffice.android.Bootstrap;
 import org.libreoffice.kit.COKit;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * JNI bridge for Collabora Office Android (`libandroidapp.so` + `liblo-native-code.so`).
- * Method names and signatures match the exact exported JNI symbols and callbacks in `libandroidapp.so`.
+ *
+ * Bridges:
+ * - JS -> Native: `window.COOLMessageHandler.postMobileMessage(msg)` -> `postMobileMessageNative(msg)`
+ * - Native -> JS: `rawCallFakeWebsocketOnMessage(byte[])` -> queues ProxySocket-framed packets
+ *   and triggers `window.socket.doSend()`, which `COWebViewClient.shouldInterceptRequest` fulfills
+ *   for `cool:/cool/mobilesocket.../write/...` with raw binary frames (zero Base64 overhead).
  */
 public class LOActivity {
 
     private static final String LOGTAG = "CollaboraBridge";
-    private static final String UNPACK_MARKER = ".collabora_unpacked_v2";
+    private static final String UNPACK_MARKER = ".collabora_unpacked_v3";
 
     static {
         COKit.ensureLibrariesLoaded();
@@ -35,11 +43,19 @@ public class LOActivity {
     private static volatile Runnable activeCloseCallback;
     private static volatile boolean envConfigured = false;
 
+    // MobileSocket (ProxySocket) inbound message queue & serial counter (starts at 1 to match global.js)
+    private static final ConcurrentLinkedQueue<byte[]> pendingFrames = new ConcurrentLinkedQueue<>();
+    private static final AtomicLong incomingSerial = new AtomicLong(1L);
+    private static final AtomicBoolean flushScheduled = new AtomicBoolean(false);
+
     public LOActivity(Activity activity) {
         this.activity = activity;
     }
 
     public void attachWebView(WebView webView, Runnable onDocumentClosedCallback) {
+        pendingFrames.clear();
+        incomingSerial.set(1L);
+        flushScheduled.set(false);
         activeWebView = webView;
         activeCloseCallback = onDocumentClosedCallback;
     }
@@ -47,6 +63,8 @@ public class LOActivity {
     public void detachWebView() {
         activeWebView = null;
         activeCloseCallback = null;
+        pendingFrames.clear();
+        flushScheduled.set(false);
     }
 
     public synchronized void ensureInitializedAndStart(String fileUriString, String userName) {
@@ -58,13 +76,13 @@ public class LOActivity {
 
         if (!envConfigured) {
             envConfigured = true;
-            COKit.putenv("SAL_LOG=-WARN-INFO");
+            COKit.redirectStdio(true);
+            COKit.putenv("SAL_LOG=+WARN+INFO");
             COKit.putenv("HOME=" + cacheDir);
             COKit.putenv("TMPDIR=" + cacheDir);
         }
 
-        // Native createCOOLWSD updates documentLoadURI & g_loActivityObj on every call
-        // and only starts the COOLWSD background thread once.
+        Log.i(LOGTAG, "Starting createCOOLWSD for " + fileUriString + " (dataDir=" + dataDir + ")");
         createCOOLWSD(
                 dataDir,
                 cacheDir,
@@ -77,33 +95,62 @@ public class LOActivity {
     }
 
     private void unpackAssetsIfNeeded(File dataDir) {
+        File fontCacheDir = new File(dataDir, "fontconfig");
+        if (!fontCacheDir.exists()) {
+            fontCacheDir.mkdirs();
+        }
         File marker = new File(dataDir, UNPACK_MARKER);
         if (marker.exists()) {
             return;
         }
         try {
-            copyAssetTree("unpack", dataDir);
+            copyAssetTree("unpack", dataDir, dataDir.getAbsolutePath(), activity.getPackageName());
             try (FileOutputStream fos = new FileOutputStream(marker)) {
                 fos.write('1');
             }
+            Log.i(LOGTAG, "Unpacked Collabora assets into " + dataDir.getAbsolutePath()
+                    + " (fonts.conf=" + new File(dataDir, "etc/fonts/fonts.conf").exists()
+                    + ", sofficerc=" + new File(dataDir, "program/sofficerc").exists()
+                    + ", udkapi.rdb=" + new File(dataDir, "program/udkapi.rdb").exists()
+                    + ", offapi.rdb=" + new File(dataDir, "program/offapi.rdb").exists() + ")");
         } catch (Exception e) {
             Log.e(LOGTAG, "Failed to unpack Collabora assets", e);
         }
     }
 
-    private void copyAssetTree(String assetPath, File targetDir) throws Exception {
+    private void copyAssetTree(String assetPath, File targetDir, String dataDirPath, String packageName) throws Exception {
         String[] children = activity.getAssets().list(assetPath);
         if (children == null || children.length == 0) {
             File parent = targetDir.getParentFile();
             if (parent != null && !parent.exists()) {
                 parent.mkdirs();
             }
-            try (InputStream in = activity.getAssets().open(assetPath);
-                 FileOutputStream out = new FileOutputStream(targetDir)) {
-                byte[] buf = new byte[16 * 1024];
-                int read;
-                while ((read = in.read(buf)) > 0) {
-                    out.write(buf, 0, read);
+            String lower = assetPath.toLowerCase();
+            boolean isTextConfig = lower.endsWith(".conf") || lower.endsWith("rc") || lower.endsWith(".ini");
+            if (isTextConfig) {
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                try (InputStream in = activity.getAssets().open(assetPath)) {
+                    byte[] buf = new byte[8 * 1024];
+                    int read;
+                    while ((read = in.read(buf)) > 0) {
+                        baos.write(buf, 0, read);
+                    }
+                }
+                String content = new String(baos.toByteArray(), StandardCharsets.UTF_8)
+                        .replace("/data/data/com.collabora.libreoffice", dataDirPath)
+                        .replace("/data/user/0/com.collabora.libreoffice", dataDirPath)
+                        .replace("com.collabora.libreoffice", packageName);
+                try (FileOutputStream out = new FileOutputStream(targetDir)) {
+                    out.write(content.getBytes(StandardCharsets.UTF_8));
+                }
+            } else {
+                try (InputStream in = activity.getAssets().open(assetPath);
+                     FileOutputStream out = new FileOutputStream(targetDir)) {
+                    byte[] buf = new byte[16 * 1024];
+                    int read;
+                    while ((read = in.read(buf)) > 0) {
+                        out.write(buf, 0, read);
+                    }
                 }
             }
             return;
@@ -112,7 +159,7 @@ public class LOActivity {
             targetDir.mkdirs();
         }
         for (String child : children) {
-            copyAssetTree(assetPath + "/" + child, new File(targetDir, child));
+            copyAssetTree(assetPath + "/" + child, new File(targetDir, child), dataDirPath, packageName);
         }
     }
 
@@ -140,22 +187,129 @@ public class LOActivity {
     public native void paste(String mimeType, byte[] data);
 
     /**
-     * Called from C++ (`libandroidapp.so` send2JS) with WebSocket frames for `TheFakeWebSocket`.
+     * Called from C++ (`libandroidapp.so` send2JS / `[app2js]` thread) with WebSocket payloads.
+     * Encodes each message into Collabora's `ProxySocket` wire format (`T`/`B` + hex serial + hex len)
+     * and nudges `window.socket.doSend()` on the UI thread to pull queued bytes via `COWebViewClient`.
      */
     @SuppressWarnings("unused")
     public void rawCallFakeWebsocketOnMessage(final byte[] message) {
-        if (message == null || activeWebView == null) {
+        if (message == null || message.length == 0 || activeWebView == null) {
             return;
         }
-        final String b64 = Base64.encodeToString(message, Base64.NO_WRAP);
-        mainHandler.post(() -> {
-            WebView wv = activeWebView;
-            if (wv != null) {
-                String js = "if (window.TheFakeWebSocket && window.TheFakeWebSocket.onmessage) { " +
-                        "window.TheFakeWebSocket.onmessage({ data: Base64ToArrayBuffer('" + b64 + "') }); }";
-                wv.evaluateJavascript(js, null);
+
+        boolean isBinary = isBinaryPayload(message);
+        long serial = incomingSerial.getAndIncrement();
+        char typePrefix = isBinary ? 'B' : 'T';
+
+        String header = typePrefix + "0x" + Long.toHexString(serial) + "\n"
+                + "0x" + Integer.toHexString(message.length) + "\n";
+        byte[] headerBytes = header.getBytes(StandardCharsets.US_ASCII);
+
+        byte[] framed = new byte[headerBytes.length + message.length + 1];
+        System.arraycopy(headerBytes, 0, framed, 0, headerBytes.length);
+        System.arraycopy(message, 0, framed, headerBytes.length, message.length);
+        framed[framed.length - 1] = '\n';
+
+        if (!isBinary) {
+            String preview = new String(message, 0, Math.min(message.length, 160), StandardCharsets.UTF_8)
+                    .replace('\n', ' ');
+            Log.i(LOGTAG, "app2js [T #" + serial + " len=" + message.length + "]: " + preview);
+        } else {
+            int nl = indexOfNewline(message);
+            String firstLine = nl > 0
+                    ? new String(message, 0, Math.min(nl, 160), StandardCharsets.UTF_8)
+                    : "(binary)";
+            Log.i(LOGTAG, "app2js [B #" + serial + " len=" + message.length + "]: " + firstLine);
+        }
+
+        pendingFrames.add(framed);
+        scheduleSocketFlush(0L);
+    }
+
+    /**
+     * Drains all queued ProxySocket-framed bytes for `COWebViewClient.shouldInterceptRequest`.
+     */
+    public static byte[] drainPendingMessages() {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] frame;
+        while ((frame = pendingFrames.poll()) != null) {
+            out.write(frame, 0, frame.length);
+        }
+        return out.toByteArray();
+    }
+
+    /**
+     * Nudges `window.socket.doSend()` on the UI thread so `ProxySocket` pulls queued frames.
+     */
+    public static void scheduleSocketFlush(long delayMs) {
+        if (delayMs > 0L) {
+            mainHandler.postDelayed(() -> {
+                WebView wv = activeWebView;
+                if (wv != null && !pendingFrames.isEmpty()) {
+                    wv.evaluateJavascript(
+                            "if (window.socket && window.socket.doSend) { window.socket.doSend(); }",
+                            null
+                    );
+                }
+            }, delayMs);
+            return;
+        }
+        if (flushScheduled.compareAndSet(false, true)) {
+            mainHandler.post(() -> {
+                flushScheduled.set(false);
+                WebView wv = activeWebView;
+                if (wv != null && !pendingFrames.isEmpty()) {
+                    wv.evaluateJavascript(
+                            "if (window.socket && window.socket.doSend) { window.socket.doSend(); }",
+                            null
+                    );
+                }
+            });
+        }
+    }
+
+    private static int indexOfNewline(byte[] data) {
+        for (int i = 0; i < data.length; i++) {
+            if (data[i] == '\n') {
+                return i;
             }
-        });
+        }
+        return -1;
+    }
+
+    private static boolean isBinaryPayload(byte[] data) {
+        // Check known binary COOL message prefixes first
+        if (startsWithAscii(data, "tile:")
+                || startsWithAscii(data, "tilecombine:")
+                || startsWithAscii(data, "windowpaint:")
+                || startsWithAscii(data, "dialogpaint:")
+                || startsWithAscii(data, "renderfont:")
+                || startsWithAscii(data, "slidelayer:")
+                || startsWithAscii(data, "deltawindow:")
+                || startsWithAscii(data, "downloadas:")) {
+            return true;
+        }
+        // Fallback: check for NUL or control bytes (excluding \t, \n, \r)
+        int limit = Math.min(data.length, 4096);
+        for (int i = 0; i < limit; i++) {
+            int b = data[i] & 0xFF;
+            if (b == 0 || (b < 0x20 && b != '\t' && b != '\n' && b != '\r')) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean startsWithAscii(byte[] data, String prefix) {
+        if (data.length < prefix.length()) {
+            return false;
+        }
+        for (int i = 0; i < prefix.length(); i++) {
+            if ((data[i] & 0xFF) != prefix.charAt(i)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -188,6 +342,8 @@ public class LOActivity {
             if (message == null) {
                 return;
             }
+            String preview = message.length() > 180 ? message.substring(0, 180) + "..." : message;
+            Log.i(LOGTAG, "js2app: " + preview);
             if ("BYE".equals(message)) {
                 Runnable cb = activeCloseCallback;
                 if (cb != null) {
@@ -199,4 +355,3 @@ public class LOActivity {
         }
     }
 }
-
