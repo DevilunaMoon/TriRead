@@ -7,6 +7,7 @@ import java.io.File
 @Composable
 fun DocViewerContent(
     tempFile: File,
+    title: String,
     isImmersive: Boolean,
     onNavigateBack: () -> Unit,
     onError: (String) -> Unit,
@@ -14,6 +15,8 @@ fun DocViewerContent(
 ) {
     CollaboraWebViewContent(
         tempFile = tempFile,
+        title = title,
+        isPresentation = false,
         isImmersive = isImmersive,
         onNavigateBack = onNavigateBack,
         onError = onError,

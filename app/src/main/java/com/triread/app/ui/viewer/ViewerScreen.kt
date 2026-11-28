@@ -130,9 +130,11 @@ fun ViewerScreen(
             }
 
             is ViewerContentState.CollaboraReady -> {
+                val docTitle = uiState.document?.title ?: "Document"
                 if (content.isPresentation) {
                     PptViewerContent(
                         tempFile = content.tempFile,
+                        title = docTitle,
                         isImmersive = uiState.isImmersive,
                         onNavigateBack = onNavigateBack,
                         onError = viewModel::onCollaboraError
@@ -140,6 +142,7 @@ fun ViewerScreen(
                 } else {
                     DocViewerContent(
                         tempFile = content.tempFile,
+                        title = docTitle,
                         isImmersive = uiState.isImmersive,
                         onNavigateBack = onNavigateBack,
                         onError = viewModel::onCollaboraError

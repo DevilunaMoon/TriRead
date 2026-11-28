@@ -33,6 +33,7 @@ public class LOActivity {
     private static final Handler mainHandler = new Handler(Looper.getMainLooper());
     private static volatile WebView activeWebView;
     private static volatile Runnable activeCloseCallback;
+    private static volatile boolean envConfigured = false;
 
     public LOActivity(Activity activity) {
         this.activity = activity;
@@ -55,9 +56,12 @@ public class LOActivity {
 
         unpackAssetsIfNeeded(new File(dataDir));
 
-        COKit.putenv("SAL_LOG=-WARN-INFO");
-        COKit.putenv("HOME=" + cacheDir);
-        COKit.putenv("TMPDIR=" + cacheDir);
+        if (!envConfigured) {
+            envConfigured = true;
+            COKit.putenv("SAL_LOG=-WARN-INFO");
+            COKit.putenv("HOME=" + cacheDir);
+            COKit.putenv("TMPDIR=" + cacheDir);
+        }
 
         // Native createCOOLWSD updates documentLoadURI & g_loActivityObj on every call
         // and only starts the COOLWSD background thread once.
