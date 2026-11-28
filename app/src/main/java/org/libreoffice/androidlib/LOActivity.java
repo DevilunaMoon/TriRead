@@ -339,19 +339,72 @@ public class LOActivity {
 
         @JavascriptInterface
         public void postMobileMessage(String message) {
-            if (message == null) {
+            if (message == null || message.isEmpty()) {
                 return;
             }
             String preview = message.length() > 180 ? message.substring(0, 180) + "..." : message;
             Log.i(LOGTAG, "js2app: " + preview);
-            if ("BYE".equals(message)) {
+
+            if ("BYE".equals(message) || "CLOSE_WINDOW".equals(message)) {
                 Runnable cb = activeCloseCallback;
                 if (cb != null) {
                     mainHandler.post(cb);
                 }
                 return;
             }
+
+            // Intercept Collabora Android UI-only messages that are NOT COOLWSD protocol commands.
+            // Forwarding these to COOLWSD triggers `error: cmd=... kind=unknown` modals in cool.html.
+            if (isAndroidUiOnlyMessage(message)) {
+                Log.d(LOGTAG, "Handled Android UI message locally: " + preview);
+                return;
+            }
+
             postMobileMessageNative(message);
+        }
+
+        private boolean isAndroidUiOnlyMessage(String message) {
+            int spaceIdx = message.indexOf(' ');
+            String cmd = spaceIdx > 0 ? message.substring(0, spaceIdx) : message;
+            switch (cmd) {
+                case "LIGHT_SCREEN":
+                case "DARK_SCREEN":
+                case "DIM_SCREEN":
+                case "hideProgressbar":
+                case "EDITMODE":
+                case "MOBILEWIZARD":
+                case "FOCUSIFHWKBD":
+                case "PRINT":
+                case "FONTPICKER":
+                case "LICENSE":
+                case "EXCHANGEMONITORS":
+                case "SYNCSETTINGS":
+                case "REQUESTFILECOPY":
+                case "FILEDRAGENTER":
+                case "SAVESTARTED":
+                case "SAVECOMPLETED":
+                case "SAVEFAILED":
+                case "SLIDESHOW":
+                case "HYPERLINK":
+                case "SETDARKMODE":
+                case "SETTEMPLATEDROPTARGET":
+                case "COMMANDRESULT":
+                case "COMMANDSTATECHANGED":
+                case "TABTHUMBNAIL":
+                case "TEXTCLIPBOARD":
+                case "REMOTEBOOTSTRAPFAILED":
+                case "exportfile":
+                case "extensionsavefile":
+                case "insertfile":
+                case "newdoc":
+                case "opendoc":
+                case "openremote":
+                case "removecloudaccount":
+                case "switchToServerMode":
+                    return true;
+                default:
+                    return false;
+            }
         }
     }
 }
