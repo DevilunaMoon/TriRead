@@ -178,9 +178,8 @@ class CollaboraViewerActivity : ComponentActivity() {
 
         val wv = WebView(this).apply {
             setBackgroundColor(bgColor)
-            // Software layer avoids Mali GPU EGL texture allocation failures (`BAD ALLOC`)
-            // that otherwise leave the WebView canvas blank.
-            setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+            // Use GPU hardware layer for smooth 60fps canvas scrolling & zooming on large documents
+            setLayerType(View.LAYER_TYPE_HARDWARE, null)
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
@@ -202,13 +201,8 @@ class CollaboraViewerActivity : ComponentActivity() {
             addJavascriptInterface(loBridge.COOLMessageHandler(), "COOLMessageHandler")
             webChromeClient = object : WebChromeClient() {
                 override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
-                    if (consoleMessage != null) {
-                        val msg = "${consoleMessage.message()} (${consoleMessage.sourceId()}:${consoleMessage.lineNumber()})"
-                        when (consoleMessage.messageLevel()) {
-                            ConsoleMessage.MessageLevel.ERROR -> Log.e(TAG_JS, msg)
-                            ConsoleMessage.MessageLevel.WARNING -> Log.w(TAG_JS, msg)
-                            else -> Log.d(TAG_JS, msg)
-                        }
+                    if (consoleMessage != null && consoleMessage.messageLevel() == ConsoleMessage.MessageLevel.ERROR) {
+                        Log.e(TAG_JS, "${consoleMessage.message()} (${consoleMessage.sourceId()}:${consoleMessage.lineNumber()})")
                     }
                     return true
                 }
@@ -216,28 +210,39 @@ class CollaboraViewerActivity : ComponentActivity() {
             webViewClient = object : COWebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     super.onPageFinished(view, url)
-                    Log.i(TAG_BRIDGE, "WebView onPageFinished: $url")
+                    // Clean Read-Only UX: hide Collabora's inner top bar, menu, and edit controls
+                    // and expand the document canvas to fill 100% of the viewer area.
                     val hideReadOnlyChromeJs = """
                         (function() {
                             var style = document.createElement('style');
-                            style.innerHTML = '#mobile-edit-button, #toolbar-down, #main-menu-btn, .unoSave, #closebutton { display: none !important; }';
+                            style.innerHTML =
+                                '#toolbar-up, #toolbar-wrapper, #main-menu-btn, #mobile-edit-button, ' +
+                                '#toolbar-down, .unoSave, #closebutton, .main-nav { display: none !important; } ' +
+                                '#document-container { top: 0 !important; bottom: 0 !important; }';
                             document.head.appendChild(style);
                         })();
                     """.trimIndent()
                     view?.evaluateJavascript(hideReadOnlyChromeJs, null)
-                    loadingOverlay?.visibility = View.GONE
                     // Ensure any queued messages from native COOLWSD are drained once page is ready
-                    LOActivity.scheduleSocketFlush(150L)
+                    LOActivity.scheduleSocketFlush(80L)
+                    // Fallback: ensure loading overlay never blocks a dialog if hideProgressbar is delayed
+                    loadingOverlay?.postDelayed({ loadingOverlay?.visibility = View.GONE }, 1200L)
                 }
             }
         }
         webView = wv
 
-        loBridge.attachWebView(wv) {
-            if (!isFinishing && !isDestroyed) {
-                finish()
+        loBridge.attachWebView(
+            wv,
+            {
+                if (!isFinishing && !isDestroyed) {
+                    finish()
+                }
+            },
+            {
+                loadingOverlay?.visibility = View.GONE
             }
-        }
+        )
 
         contentFrame.addView(wv)
         contentFrame.addView(overlay)
@@ -259,6 +264,9 @@ class CollaboraViewerActivity : ComponentActivity() {
 
         // Start COOLWSD strictly once on a background thread
         if (hasStartedEngine.compareAndSet(false, true)) {
+            // Mark temp file read-only so LibreOfficeKit opens directly in read-only mode
+            // without prompting "Font Disallows Editing — Open document in read-only mode?"
+            runCatching { File(filePath).setReadOnly() }
             val fileUri = "file://$filePath"
             initExecutor.execute {
                 val error = try {
@@ -276,10 +284,10 @@ class CollaboraViewerActivity : ComponentActivity() {
                         val coolUrl = "file:///android_asset/dist/cool.html" +
                             "?file_path=${Uri.encode(fileUri)}" +
                             "&permission=readonly" +
+                            "&startreadonly=true" +
                             "&closebutton=false" +
                             "&userinterfacemode=classic" +
                             "&lang=en"
-                        Log.i(TAG_BRIDGE, "Loading cool.html: $coolUrl")
                         wv.loadUrl(coolUrl)
                     }
                 }

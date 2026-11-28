@@ -52,6 +52,7 @@ class CollaboraTempFileManager(
         if (file == null) return
         runCatching {
             if (file.exists()) {
+                file.setWritable(true)
                 file.delete()
             }
         }

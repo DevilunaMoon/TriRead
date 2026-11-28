@@ -46,10 +46,9 @@ public class COWebViewClient extends WebViewClient {
             headers.put("Cache-Control", "no-store");
 
             if (url.contains("/open/")) {
-                Log.i(LOGTAG, "MobileSocket /open/ handshake intercepted: " + url);
                 byte[] sessionId = "mobile".getBytes(StandardCharsets.UTF_8);
                 // Flush any early native messages shortly after JS marks readyState = 1
-                LOActivity.scheduleSocketFlush(80L);
+                LOActivity.scheduleSocketFlush(40L);
                 return new WebResourceResponse(
                         "text/plain",
                         "UTF-8",
@@ -62,7 +61,6 @@ public class COWebViewClient extends WebViewClient {
 
             if (url.contains("/write/")) {
                 byte[] payload = LOActivity.drainPendingMessages();
-                Log.d(LOGTAG, "MobileSocket /write/ returning " + payload.length + " bytes");
                 return new WebResourceResponse(
                         "application/octet-stream",
                         null,
@@ -74,7 +72,6 @@ public class COWebViewClient extends WebViewClient {
             }
 
             if (url.contains("/close/")) {
-                Log.i(LOGTAG, "MobileSocket /close/ intercepted");
                 return new WebResourceResponse(
                         "text/plain",
                         "UTF-8",

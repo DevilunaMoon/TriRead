@@ -41,28 +41,33 @@ public class LOActivity {
     private static final Handler mainHandler = new Handler(Looper.getMainLooper());
     private static volatile WebView activeWebView;
     private static volatile Runnable activeCloseCallback;
+    private static volatile Runnable activeReadyCallback;
     private static volatile boolean envConfigured = false;
 
     // MobileSocket (ProxySocket) inbound message queue & serial counter (starts at 1 to match global.js)
     private static final ConcurrentLinkedQueue<byte[]> pendingFrames = new ConcurrentLinkedQueue<>();
     private static final AtomicLong incomingSerial = new AtomicLong(1L);
     private static final AtomicBoolean flushScheduled = new AtomicBoolean(false);
+    private static final String JS_FLUSH_SOCKET =
+            "if (window.socket && window.socket.sessionId !== 'open' && window.socket.doSend) { window.socket.doSend(); }";
 
     public LOActivity(Activity activity) {
         this.activity = activity;
     }
 
-    public void attachWebView(WebView webView, Runnable onDocumentClosedCallback) {
+    public void attachWebView(WebView webView, Runnable onDocumentClosedCallback, Runnable onDocumentReadyCallback) {
         pendingFrames.clear();
         incomingSerial.set(1L);
         flushScheduled.set(false);
         activeWebView = webView;
         activeCloseCallback = onDocumentClosedCallback;
+        activeReadyCallback = onDocumentReadyCallback;
     }
 
     public void detachWebView() {
         activeWebView = null;
         activeCloseCallback = null;
+        activeReadyCallback = null;
         pendingFrames.clear();
         flushScheduled.set(false);
     }
@@ -76,13 +81,12 @@ public class LOActivity {
 
         if (!envConfigured) {
             envConfigured = true;
-            COKit.redirectStdio(true);
-            COKit.putenv("SAL_LOG=+WARN+INFO");
+            // Silence verbose LibreOfficeKit logs on hot rendering path for smooth scrolling
+            COKit.putenv("SAL_LOG=-WARN-INFO");
             COKit.putenv("HOME=" + cacheDir);
             COKit.putenv("TMPDIR=" + cacheDir);
         }
 
-        Log.i(LOGTAG, "Starting createCOOLWSD for " + fileUriString + " (dataDir=" + dataDir + ")");
         createCOOLWSD(
                 dataDir,
                 cacheDir,
@@ -210,27 +214,16 @@ public class LOActivity {
         System.arraycopy(message, 0, framed, headerBytes.length, message.length);
         framed[framed.length - 1] = '\n';
 
-        if (!isBinary) {
-            String preview = new String(message, 0, Math.min(message.length, 160), StandardCharsets.UTF_8)
-                    .replace('\n', ' ');
-            Log.i(LOGTAG, "app2js [T #" + serial + " len=" + message.length + "]: " + preview);
-        } else {
-            int nl = indexOfNewline(message);
-            String firstLine = nl > 0
-                    ? new String(message, 0, Math.min(nl, 160), StandardCharsets.UTF_8)
-                    : "(binary)";
-            Log.i(LOGTAG, "app2js [B #" + serial + " len=" + message.length + "]: " + firstLine);
-        }
-
         pendingFrames.add(framed);
-        scheduleSocketFlush(0L);
+        // Coalesce burst tile frames within 8ms into a single XHR pull
+        scheduleSocketFlush(8L);
     }
 
     /**
      * Drains all queued ProxySocket-framed bytes for `COWebViewClient.shouldInterceptRequest`.
      */
     public static byte[] drainPendingMessages() {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        ByteArrayOutputStream out = new ByteArrayOutputStream(32 * 1024);
         byte[] frame;
         while ((frame = pendingFrames.poll()) != null) {
             out.write(frame, 0, frame.length);
@@ -242,29 +235,19 @@ public class LOActivity {
      * Nudges `window.socket.doSend()` on the UI thread so `ProxySocket` pulls queued frames.
      */
     public static void scheduleSocketFlush(long delayMs) {
-        if (delayMs > 0L) {
-            mainHandler.postDelayed(() -> {
-                WebView wv = activeWebView;
-                if (wv != null && !pendingFrames.isEmpty()) {
-                    wv.evaluateJavascript(
-                            "if (window.socket && window.socket.doSend) { window.socket.doSend(); }",
-                            null
-                    );
-                }
-            }, delayMs);
-            return;
-        }
         if (flushScheduled.compareAndSet(false, true)) {
-            mainHandler.post(() -> {
+            Runnable task = () -> {
                 flushScheduled.set(false);
                 WebView wv = activeWebView;
                 if (wv != null && !pendingFrames.isEmpty()) {
-                    wv.evaluateJavascript(
-                            "if (window.socket && window.socket.doSend) { window.socket.doSend(); }",
-                            null
-                    );
+                    wv.evaluateJavascript(JS_FLUSH_SOCKET, null);
                 }
-            });
+            };
+            if (delayMs > 0L) {
+                mainHandler.postDelayed(task, delayMs);
+            } else {
+                mainHandler.post(task);
+            }
         }
     }
 
@@ -329,7 +312,7 @@ public class LOActivity {
 
         @JavascriptInterface
         public void postMobileDebug(String message) {
-            Log.d(LOGTAG, "JS Debug: " + message);
+            // No-op in production for smooth scrolling
         }
 
         @JavascriptInterface
@@ -342,8 +325,6 @@ public class LOActivity {
             if (message == null || message.isEmpty()) {
                 return;
             }
-            String preview = message.length() > 180 ? message.substring(0, 180) + "..." : message;
-            Log.i(LOGTAG, "js2app: " + preview);
 
             if ("BYE".equals(message) || "CLOSE_WINDOW".equals(message)) {
                 Runnable cb = activeCloseCallback;
@@ -353,10 +334,17 @@ public class LOActivity {
                 return;
             }
 
+            if ("hideProgressbar".equals(message)) {
+                Runnable cb = activeReadyCallback;
+                if (cb != null) {
+                    mainHandler.post(cb);
+                }
+                return;
+            }
+
             // Intercept Collabora Android UI-only messages that are NOT COOLWSD protocol commands.
             // Forwarding these to COOLWSD triggers `error: cmd=... kind=unknown` modals in cool.html.
             if (isAndroidUiOnlyMessage(message)) {
-                Log.d(LOGTAG, "Handled Android UI message locally: " + preview);
                 return;
             }
 
